@@ -96,34 +96,12 @@ This repo is designed for you to download, run locally, and extend.
 
 ### Project Ideas
 
-Here are some directions you can take. Pick one or combine a few:
+Some broad directions — be creative:
 
-**UI / UX Improvements**
-- Redesign the chat interface or sidebar layout
-- Add dark mode or custom themes
-- Show a history of generated images
-- Add a comparison view for different style presets
-
-**Prompt & Brief Design**
-- Improve the system prompt for better creative briefs
-- Add new fields (e.g. brand colors, logo placement, seasonal theme)
-- Experiment with different prompt structures for image generation
-- Add prompt templates for specific industries (fashion, tech, food)
-
-**New Tools & Features**
-- Add a new image generation backend (e.g. Stability AI, Flux, DALL-E 3)
-- Add video generation (e.g. Sora, Veo, Runway)
-- Add multi-image generation for A/B testing
-- Add image editing / refinement after generation
-
-**Post-Generation Enhancements**
-- Add feedback-based iteration (user rates the image, agent improves)
-- Add text overlay editing (adjust headline position, font, size)
-- Export in multiple formats or sizes
-- Generate campaign analytics or audience insights
-
-**New Style Presets**
-- Drop a PNG in `style/`, add an entry to `STYLE_PRESETS` in `schema.py` — that's it
+- **Better UI / UX** — redesign the interface, improve the workflow
+- **Better prompts** — improve the system prompt, brief format, or generation prompt
+- **New tools** — add video generation, image editing, multi-image A/B testing
+- **Post-generation** — feedback loops, adaptive improvement, analytics
 
 ## License
 
