@@ -39,7 +39,17 @@ style/          Style reference images (6 presets)
 
 ### Install & Run
 
-These commands work on **both macOS and Windows**:
+**Option A — Download ZIP (no Git needed, no account needed)**
+
+1. Click the green **Code** button on this page > **Download ZIP**
+2. Unzip the folder, open a terminal inside it, then run:
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+**Option B — Git clone (also no account needed)**
 
 ```bash
 git clone https://github.com/zikunye2/ad-campaign-agent.git
@@ -48,11 +58,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-> **Windows note:** Make sure Python and Git are installed and added to your PATH.
-> If `pip` doesn't work, try `pip3` or `python -m pip`.
->
-> **New to Git?** See GitHub's official getting started guide:
-> [docs.github.com/en/get-started](https://docs.github.com/en/get-started/start-your-journey)
+These commands work on **both macOS and Windows**. If `pip` doesn't work, try `python -m pip install -r requirements.txt`.
 
 Enter your API key(s) in the sidebar and start chatting.
 
@@ -73,13 +79,12 @@ This repo is designed for you to download, run locally, and extend.
 
 ### Getting Started
 
-1. **Download the code** — `git clone` (above) or download as ZIP from the green **Code** button on GitHub
-2. **Install dependencies** — `pip install -r requirements.txt`
-3. **Run it** — `streamlit run app.py`
-4. **Make changes** — edit the Python files, save, and Streamlit auto-reloads
-5. **Show your work** — screenshot the app, explain what you changed and why
+1. **Download the code** — see [Install & Run](#install--run) above (ZIP or git clone, no account needed)
+2. **Run it** — `pip install -r requirements.txt` then `streamlit run app.py`
+3. **Make changes** — edit the Python files, save, and Streamlit auto-reloads
+4. **Show your work** — screenshot the app, explain what you changed and why
 
-> **New to GitHub / Git?** You don't need an account to download and run this. Just click the green **Code** button > **Download ZIP**. If you'd like to learn Git, check out GitHub's official guide: [docs.github.com/en/get-started](https://docs.github.com/en/get-started/start-your-journey)
+> **New to Git?** Check out GitHub's official guide: [docs.github.com/en/get-started](https://docs.github.com/en/get-started/start-your-journey)
 
 ### Project Ideas
 
