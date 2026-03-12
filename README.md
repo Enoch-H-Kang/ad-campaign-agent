@@ -58,7 +58,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-These commands work on **both macOS and Windows**. If `pip` doesn't work, try `python -m pip install -r requirements.txt`.
+**Option C — Use a coding agent**
+
+Give this repo URL to a coding agent like [Claude Code](https://claude.ai/claude-code), [Codex](https://chatgpt.com/codex), or [Cursor](https://cursor.com) — it will clone the repo, install dependencies, and run the app for you. From there you can ask the agent to add features, fix bugs, or modify the code.
+
+```
+https://github.com/zikunye2/ad-campaign-agent.git
+```
+
+All options work on **both macOS and Windows**. If `pip` doesn't work, try `python -m pip install -r requirements.txt`.
 
 Enter your API key(s) in the sidebar and start chatting.
 
