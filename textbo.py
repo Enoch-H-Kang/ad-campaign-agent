@@ -4,6 +4,7 @@ import base64
 import json
 import math
 import mimetypes
+import os
 from typing import Any
 
 import streamlit as st
@@ -19,6 +20,7 @@ from generate import generate_image_gemini, generate_image_openai
 from schema import STYLE_DIR, STYLE_PRESETS
 
 TEXT_MODEL = "gpt-5-mini"
+EVAL_MODEL = "gpt-4o"
 DEFAULT_INITIAL_PROMPTS = 10
 DEFAULT_LOWEST_PROMPTS = 5
 DEFAULT_OPTIMIZATION_STEPS = 10
@@ -67,7 +69,7 @@ def _parse_json_text(text: str) -> dict[str, Any]:
 def _request_json_object(
     client,
     system_prompt: str,
-    user_prompt: str,
+    user_prompt: str | list[dict[str, Any]],
     *,
     temperature: float = 1.0,
     max_completion_tokens: int = 8192,
@@ -195,6 +197,136 @@ def _history_summary(
     return "\n".join(lines)
 
 
+def _reflection_examples(
+    candidates: list[dict[str, Any]],
+    *,
+    top_n: int = 4,
+    bottom_n: int = 4,
+) -> list[dict[str, Any]]:
+    """Select ranked high/low examples for multimodal reflection."""
+    if not candidates:
+        return []
+
+    sorted_candidates = sorted(candidates, key=lambda c: c.get("score", 0.0))
+    ranked_candidates = list(enumerate(sorted_candidates, start=1))
+    total = len(ranked_candidates)
+    examples: list[dict[str, Any]] = []
+
+    if total < top_n + bottom_n:
+        midpoint = total // 2
+        lower_half = ranked_candidates[:midpoint]
+        upper_half = ranked_candidates[midpoint:]
+
+        for overall_rank, entry in lower_half:
+            examples.append(
+                {
+                    "entry": entry,
+                    "overall_rank": overall_rank,
+                    "total": total,
+                    "performance_label": "LOWER HALF",
+                }
+            )
+        for overall_rank, entry in upper_half:
+            examples.append(
+                {
+                    "entry": entry,
+                    "overall_rank": overall_rank,
+                    "total": total,
+                    "performance_label": "UPPER HALF",
+                }
+            )
+        return examples
+
+    bottom_examples = ranked_candidates[:bottom_n]
+    top_examples = list(reversed(ranked_candidates[-top_n:]))
+
+    for cohort_rank, (overall_rank, entry) in enumerate(bottom_examples, start=1):
+        examples.append(
+            {
+                "entry": entry,
+                "overall_rank": overall_rank,
+                "total": total,
+                "performance_label": f"{cohort_rank} WORST PERFORMING",
+            }
+        )
+
+    for cohort_rank, (overall_rank, entry) in enumerate(top_examples, start=1):
+        examples.append(
+            {
+                "entry": entry,
+                "overall_rank": overall_rank,
+                "total": total,
+                "performance_label": f"{cohort_rank} BEST PERFORMING",
+            }
+        )
+
+    return examples
+
+
+def _build_multimodal_reflection_content(
+    candidates: list[dict[str, Any]],
+    *,
+    top_n: int = 4,
+    bottom_n: int = 4,
+) -> list[dict[str, Any]]:
+    """Build multimodal reflection content from ranked prompt/image history."""
+    examples = _reflection_examples(candidates, top_n=top_n, bottom_n=bottom_n)
+    if not examples:
+        return []
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "You are analyzing historical ad optimization results for one campaign.\n\n"
+                "You will receive lower-performing and higher-performing examples. Each "
+                "example includes an overall rank, score, prompt excerpt, and the rendered "
+                "ad image when available.\n\n"
+                "Infer visual and prompt-level patterns that tend to help or hurt performance. "
+                "Focus on actionable differences between strong and weak ads.\n\n"
+                'Return JSON with one key: "reflection". The reflection should be one short '
+                "paragraph."
+            ),
+        }
+    ]
+
+    for example in examples:
+        entry = example["entry"]
+        output_path = str(entry.get("output_path") or "").strip()
+        example_text = (
+            f"{example['performance_label']} "
+            f"(Rank #{example['overall_rank']}/{example['total']}, "
+            f"Score: {entry.get('score', 0.0):.3f})\n"
+            f"Prompt excerpt: {_prompt_excerpt(entry.get('prompt', ''), max_chars=240)}"
+        )
+        content.append({"type": "text", "text": example_text})
+
+        if output_path and os.path.exists(output_path):
+            try:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _path_to_data_url(output_path)},
+                    }
+                )
+            except Exception:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": "[Image could not be loaded for this example.]",
+                    }
+                )
+        else:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "[Rendered image not available for this example.]",
+                }
+            )
+
+    return content
+
+
 def _score_from_probs(probs: dict[str, float]) -> float:
     """Convert 1-5 probabilities into an expected score."""
     return sum(int(k) * probs[k] for k in sorted(probs.keys()))
@@ -263,7 +395,7 @@ Do not explain your answer."""
 
     try:
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=EVAL_MODEL,
             messages=[
                 {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
                 {"role": "user", "content": judge_prompt},
@@ -277,7 +409,7 @@ Do not explain your answer."""
         probs = _extract_digit_probs_from_completion(response)
     except Exception:
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=EVAL_MODEL,
             messages=[
                 {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
                 {"role": "user", "content": judge_prompt},
@@ -329,7 +461,7 @@ Do not explain your answer."""
 
     try:
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=EVAL_MODEL,
             messages=[
                 {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
                 {
@@ -351,7 +483,7 @@ Do not explain your answer."""
     except Exception:
         try:
             response = client.chat.completions.create(
-                model=TEXT_MODEL,
+                model=EVAL_MODEL,
                 messages=[
                     {"role": "system", "content": "Return exactly one token: 1, 2, 3, 4, or 5."},
                     {
@@ -517,8 +649,9 @@ def _generate_shared_reflection(
     if len(shared_history) < 2:
         return "No strong shared pattern yet."
 
-    system_prompt = "You analyze prompt-performance patterns. Return JSON only."
-    user_prompt = f"""Review the prompt history below and infer what tends to help or hurt performance.
+    def _text_only_reflection() -> str:
+        system_prompt = "You analyze prompt-performance patterns. Return JSON only."
+        user_prompt = f"""Review the prompt history below and infer what tends to help or hurt performance.
 
 {_history_summary(shared_history, top_n=4, bottom_n=4)}
 
@@ -526,15 +659,38 @@ Return JSON with one key: "reflection".
 The reflection should be one short paragraph focused on actionable prompt-level patterns.
 """
 
-    payload = _request_json_object(
-        client,
-        system_prompt,
-        user_prompt,
-        temperature=0.7,
-        max_completion_tokens=2048,
+        payload = _request_json_object(
+            client,
+            system_prompt,
+            user_prompt,
+            temperature=0.7,
+            max_completion_tokens=2048,
+        )
+        reflection = str(payload.get("reflection", "")).strip()
+        return reflection or "No strong shared pattern yet."
+
+    multimodal_content = _build_multimodal_reflection_content(
+        shared_history,
+        top_n=4,
+        bottom_n=4,
     )
+    if not multimodal_content:
+        return _text_only_reflection()
+
+    system_prompt = "You analyze ad-performance patterns from prompt/image history. Return JSON only."
+    try:
+        payload = _request_json_object(
+            client,
+            system_prompt,
+            multimodal_content,
+            temperature=0.7,
+            max_completion_tokens=2048,
+        )
+    except Exception:
+        return _text_only_reflection()
+
     reflection = str(payload.get("reflection", "")).strip()
-    return reflection or "No strong shared pattern yet."
+    return reflection or _text_only_reflection()
 
 
 def _generate_efficient_candidates(
