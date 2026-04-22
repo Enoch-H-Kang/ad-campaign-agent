@@ -20,7 +20,7 @@ from agent import (
 from generate import generate_image_gemini, generate_image_openai
 from schema import STYLE_DIR, STYLE_PRESETS
 
-TEXT_MODEL = "gpt-5-mini"
+TEXT_MODEL = "gpt-5-nano"
 EVAL_MODEL = "gpt-4o"
 DEFAULT_INITIAL_PROMPTS = 10
 DEFAULT_LOWEST_PROMPTS = 5
@@ -32,10 +32,15 @@ DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM = 10
 DEFAULT_EFFICIENT_PRESCORE_PARALLELISM = 10
 
 
+def _failure_probs() -> dict[str, float]:
+    """Use a pessimistic fallback when scoring/parsing fails."""
+    return {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+
+
 def _one_hot_probs(selected: str | None) -> dict[str, float]:
     """Create a one-hot probability distribution for 1-5."""
     if selected not in {"1", "2", "3", "4", "5"}:
-        return {str(i): 0.2 for i in range(1, 6)}
+        return _failure_probs()
     return {str(i): (1.0 if str(i) == selected else 0.0) for i in range(1, 6)}
 
 
@@ -78,7 +83,7 @@ def _request_json_object(
     temperature: float = 1.0,
     max_completion_tokens: int = 8192,
 ) -> dict[str, Any]:
-    """Request a JSON object from GPT-5-mini."""
+    """Request a JSON object from GPT-5-nano."""
     try:
         response = client.chat.completions.create(
             model=TEXT_MODEL,
@@ -362,7 +367,7 @@ def _extract_digit_probs_from_completion(response) -> dict[str, float]:
             total = 1.0
 
     if total <= 0:
-        return {str(i): 0.2 for i in range(1, 6)}
+        return _failure_probs()
 
     return {key: value / total for key, value in probs.items()}
 
@@ -411,6 +416,7 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _extract_digit_probs_from_completion(response)
+        mode = "prompt-logprobs"
     except Exception:
         response = client.chat.completions.create(
             model=EVAL_MODEL,
@@ -423,10 +429,11 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
+        mode = "prompt-plain"
     return {
         "score": _score_from_probs(probs),
         "probs": probs,
-        "mode": "prompt",
+        "mode": mode,
     }
 
 
@@ -483,7 +490,7 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _extract_digit_probs_from_completion(response)
-        mode = "image"
+        mode = "image-logprobs"
     except Exception:
         try:
             response = client.chat.completions.create(
@@ -503,7 +510,7 @@ Do not explain your answer."""
                 seed=seed,
             )
             probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
-            mode = "image"
+            mode = "image-plain"
         except Exception:
             fallback = _score_prompt_with_logprobs(
                 client,
@@ -514,7 +521,7 @@ Do not explain your answer."""
                 seed=seed,
             )
             probs = fallback["probs"]
-            mode = "prompt-fallback"
+            mode = f"prompt-fallback:{fallback.get('mode', 'unknown')}"
     return {
         "score": _score_from_probs(probs),
         "probs": probs,
@@ -533,9 +540,9 @@ def _aggregate_soft_scores(
     mode = None
     for idx in range(max(1, repeats)):
         try:
-            result = scorer(seed=None if seed_base is None else seed_base + idx)
+            result = scorer(None if seed_base is None else seed_base + idx)
         except Exception:
-            result = {"probs": {str(i): 0.2 for i in range(1, 6)}, "mode": "fallback"}
+            result = {"probs": _failure_probs(), "mode": "fallback"}
         all_probs.append(result["probs"])
         mode = result.get("mode")
 
@@ -667,7 +674,7 @@ The reflection should be one short paragraph focused on actionable prompt-level 
             client,
             system_prompt,
             user_prompt,
-            temperature=0.7,
+            temperature=1.0,
             max_completion_tokens=2048,
         )
         reflection = str(payload.get("reflection", "")).strip()
@@ -687,7 +694,7 @@ The reflection should be one short paragraph focused on actionable prompt-level 
             client,
             system_prompt,
             multimodal_content,
-            temperature=0.7,
+            temperature=1.0,
             max_completion_tokens=2048,
         )
     except Exception:
@@ -805,6 +812,8 @@ def _build_candidate_record(
     error: str | None = None,
     prompt_prescore: float | None = None,
     prompt_prescore_probs: dict[str, float] | None = None,
+    score_mode: str | None = None,
+    prompt_prescore_mode: str | None = None,
     strategy: str | None = None,
     accepted: bool | None = None,
     start_seed_id: str | None = None,
@@ -824,6 +833,8 @@ def _build_candidate_record(
         "error": error,
         "prompt_prescore": prompt_prescore,
         "prompt_prescore_probs": prompt_prescore_probs,
+        "score_mode": score_mode,
+        "prompt_prescore_mode": prompt_prescore_mode,
         "strategy": strategy,
         "accepted": accepted,
         "start_seed_id": start_seed_id,
@@ -877,9 +888,11 @@ def _evaluate_initial_candidate(
         )
         score = scored["score"]
         probs = scored["probs"]
+        score_mode = scored.get("mode")
     else:
         score = 1.0
         probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+        score_mode = "image-generation-failed"
 
     return {
         "candidate_idx": candidate_idx,
@@ -892,6 +905,7 @@ def _evaluate_initial_candidate(
             probs=probs,
             source="initial",
             error=error,
+            score_mode=score_mode,
         ),
     }
 
@@ -925,6 +939,7 @@ def _prescore_efficient_candidate(
         "prompt": candidate_prompt,
         "score": prompt_scored["score"],
         "probs": prompt_scored["probs"],
+        "mode": prompt_scored.get("mode"),
     }
 
 
@@ -1025,9 +1040,11 @@ def _run_efficient_trajectory_step(
         )
         final_score = image_scored["score"]
         final_probs = image_scored["probs"]
+        final_score_mode = image_scored.get("mode")
     else:
         final_score = 1.0
         final_probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+        final_score_mode = "image-generation-failed"
 
     accepted = final_score > current["score"]
     step_entry = _build_candidate_record(
@@ -1040,6 +1057,8 @@ def _run_efficient_trajectory_step(
         error=error,
         prompt_prescore=selected_prompt_entry["score"],
         prompt_prescore_probs=selected_prompt_entry["probs"],
+        score_mode=final_score_mode,
+        prompt_prescore_mode=selected_prompt_entry.get("mode"),
         strategy=proposals.get("strategy"),
         accepted=accepted,
         start_seed_id=trajectory["seed"]["candidate_id"],
@@ -1128,9 +1147,11 @@ def _run_base_optimizer(
                 )
                 score = scored["score"]
                 probs = scored["probs"]
+                score_mode = scored.get("mode")
             else:
                 score = 1.0
                 probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+                score_mode = "image-generation-failed"
 
             accepted = score > current["score"]
             step_entry = _build_candidate_record(
@@ -1141,6 +1162,7 @@ def _run_base_optimizer(
                 probs=probs,
                 source="base",
                 error=error,
+                score_mode=score_mode,
                 strategy=revision.get("strategy"),
                 accepted=accepted,
                 start_seed_id=seed["candidate_id"],
@@ -1286,20 +1308,25 @@ def _run_efficient_optimizer(
             "prompt": step_winner_entry["prompt"],
             "strategy": step_winner_entry.get("strategy"),
             "candidate_id": step_winner_entry["candidate_id"],
+            "score_mode": step_winner_entry.get("score_mode"),
+            "prompt_prescore_mode": step_winner_entry.get("prompt_prescore_mode"),
         }
         step_winners.append(step_winner)
         report(
             f"Efficient step {step}/{optimization_steps} winner: trajectory "
             f"{step_winner['trajectory_id']} | pre-score "
-            f"{(step_winner['prompt_prescore'] or 0.0):.3f} | "
-            f"final score {step_winner['score']:.3f}"
+            f"{_format_score(step_winner['prompt_prescore'] or 0.0)} "
+            f"({step_winner.get('prompt_prescore_mode') or 'unknown'}) | "
+            f"final score {_format_score(step_winner['score'])} "
+            f"({step_winner.get('score_mode') or 'unknown'})"
         )
         if report_image and step_winner.get("output_path"):
             report_image(
                 step_winner["output_path"],
                 caption=(
                     f"Efficient step {step} winner | trajectory {step_winner['trajectory_id']} | "
-                    f"score {step_winner['score']:.3f}"
+                    f"score {_format_score(step_winner['score'])} "
+                    f"({step_winner.get('score_mode') or 'unknown'})"
                 ),
             )
 
@@ -1409,6 +1436,7 @@ def _run_search_pipeline(
                         probs={str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)},
                         source="initial",
                         error=f"Initial candidate failed: {exc}",
+                        score_mode="worker-exception",
                     ),
                 }
 
@@ -1502,6 +1530,11 @@ def _render_probs(probs: dict[str, float]) -> str:
     return " | ".join(f"{k}: {probs.get(k, 0.0):.2f}" for k in ["1", "2", "3", "4", "5"])
 
 
+def _format_score(score: float) -> str:
+    """Render enough precision to distinguish near-integer scores."""
+    return f"{score:.6f}"
+
+
 def _render_candidate_gallery(
     title: str,
     candidates: list[dict[str, Any]],
@@ -1522,11 +1555,16 @@ def _render_candidate_gallery(
             with col:
                 st.markdown('<div class="output-card">', unsafe_allow_html=True)
                 st.markdown(
-                    f"**Score:** {candidate['score']:.3f}  \n"
+                    f"**Score:** {_format_score(candidate['score'])}  \n"
+                    f"**Score Mode:** {candidate.get('score_mode', 'unknown')}  \n"
                     f"**Source:** {candidate['source']}"
                 )
                 if candidate.get("prompt_prescore") is not None:
-                    st.caption(f"Prompt pre-score: {candidate['prompt_prescore']:.3f}")
+                    st.caption(
+                        "Prompt pre-score: "
+                        f"{_format_score(candidate['prompt_prescore'])} "
+                        f"({candidate.get('prompt_prescore_mode', 'unknown')})"
+                    )
                 if candidate.get("output_path"):
                     st.image(candidate["output_path"], use_container_width=True)
                 else:
@@ -1544,15 +1582,16 @@ def _render_base_results(results: dict[str, Any]) -> None:
     st.subheader("Base Search")
     best = results["best"]
     st.markdown(
-        f"Best base result: **{best['score']:.3f}** from seed `{best.get('start_seed_id', 'n/a')}`."
+        f"Best base result: **{_format_score(best['score'])}** "
+        f"({best.get('score_mode', 'unknown')}) from seed `{best.get('start_seed_id', 'n/a')}`."
     )
 
     for chain in results["chains"]:
         seed = chain["seed"]
         best_chain = chain["best"]
         with st.expander(
-            f"Chain {chain['chain_id']} | seed score {seed['score']:.3f} | "
-            f"best {best_chain['score']:.3f}",
+            f"Chain {chain['chain_id']} | seed score {_format_score(seed['score'])} | "
+            f"best {_format_score(best_chain['score'])}",
             expanded=False,
         ):
             st.markdown(f"**Seed prompt:** `{seed['candidate_id']}`")
@@ -1573,7 +1612,8 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
     st.subheader("Efficient Search")
     best = results["best"]
     st.markdown(
-        f"Best efficient result: **{best['score']:.3f}** from seed `{best.get('start_seed_id', 'n/a')}`."
+        f"Best efficient result: **{_format_score(best['score'])}** "
+        f"({best.get('score_mode', 'unknown')}) from seed `{best.get('start_seed_id', 'n/a')}`."
     )
 
     if results.get("step_winners"):
@@ -1582,8 +1622,10 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                 st.markdown(
                     f"**Step {winner['step']}** | "
                     f"trajectory {winner['trajectory_id']} | "
-                    f"pre-score {(winner.get('prompt_prescore') or 0.0):.3f} | "
-                    f"final score {winner['score']:.3f}"
+                    f"pre-score {_format_score(winner.get('prompt_prescore') or 0.0)} "
+                    f"({winner.get('prompt_prescore_mode', 'unknown')}) | "
+                    f"final score {_format_score(winner['score'])} "
+                    f"({winner.get('score_mode', 'unknown')})"
                 )
                 if winner.get("output_path"):
                     st.image(winner["output_path"], use_container_width=True)
@@ -1604,8 +1646,8 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
         seed = trajectory["seed"]
         best_traj = trajectory["best"]
         with st.expander(
-            f"Trajectory {trajectory['trajectory_id']} | seed score {seed['score']:.3f} | "
-            f"best {best_traj['score']:.3f}",
+            f"Trajectory {trajectory['trajectory_id']} | seed score {_format_score(seed['score'])} | "
+            f"best {_format_score(best_traj['score'])}",
             expanded=False,
         ):
             st.markdown(f"**Seed prompt:** `{seed['candidate_id']}`")
@@ -1616,8 +1658,10 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
             for step_entry in trajectory["steps"]:
                 st.markdown(
                     f"**Step {step_entry['step']}** | "
-                    f"pre-score {step_entry.get('prompt_prescore', 0.0):.3f} | "
-                    f"final score {step_entry['score']:.3f}"
+                    f"pre-score {_format_score(step_entry.get('prompt_prescore', 0.0))} "
+                    f"({step_entry.get('prompt_prescore_mode', 'unknown')}) | "
+                    f"final score {_format_score(step_entry['score'])} "
+                    f"({step_entry.get('score_mode', 'unknown')})"
                 )
                 if step_entry.get("output_path"):
                     st.image(step_entry["output_path"], use_container_width=True)
@@ -1628,7 +1672,8 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                     ):
                         for cand in step_entry["candidate_prompts"]:
                             st.markdown(
-                                f"- pre-score {cand['score']:.3f} | "
+                                f"- pre-score {_format_score(cand['score'])} "
+                                f"({cand.get('mode', 'unknown')}) | "
                                 f"{_prompt_excerpt(cand['prompt'], 260)}"
                             )
                 st.code(step_entry["prompt"], language="text")
@@ -1730,7 +1775,7 @@ st.markdown(
 )
 
 st.title("Ad Campaign Agent Optimizer")
-st.caption("GPT-5-mini + prompt search + image generation")
+st.caption("GPT-5-nano + prompt search + image generation")
 
 # ─── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
@@ -2093,14 +2138,15 @@ if st.session_state.optimization_results:
     col1, col2, col3 = st.columns(3)
     with col1:
         best_initial = max(results["initial_candidates"], key=lambda item: item["score"])
-        st.metric("Best Initial", f"{best_initial['score']:.3f}")
+        st.metric("Best Initial", _format_score(best_initial["score"]))
     with col2:
-        st.metric("Best Base", f"{results['base']['best']['score']:.3f}")
+        st.metric("Best Base", _format_score(results["base"]["best"]["score"]))
     with col3:
-        st.metric("Best Efficient", f"{results['efficient']['best']['score']:.3f}")
+        st.metric("Best Efficient", _format_score(results["efficient"]["best"]["score"]))
 
     st.markdown(
-        f"**Overall best score:** {overall_best['score']:.3f} from `{overall_best['source']}`."
+        f"**Overall best score:** {_format_score(overall_best['score'])} "
+        f"({overall_best.get('score_mode', 'unknown')}) from `{overall_best['source']}`."
     )
     if overall_best.get("output_path"):
         st.image(overall_best["output_path"], use_container_width=True)
