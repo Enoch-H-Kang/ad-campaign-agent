@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import traceback
 from typing import Any
 
 import streamlit as st
@@ -135,6 +136,31 @@ def _dedupe_prompts(prompts: list[str]) -> list[str]:
         seen.add(key)
         deduped.append(cleaned)
     return deduped
+
+
+def _format_exception_traceback(exc: BaseException) -> str:
+    """Format an exception traceback for the debug UI."""
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _record_debug_event(
+    stage: str,
+    message: str,
+    *,
+    error_type: str | None = None,
+    traceback_text: str | None = None,
+) -> None:
+    """Persist a lightweight debug event across reruns."""
+    events = list(st.session_state.get("debug_events", []))
+    events.append(
+        {
+            "stage": stage,
+            "message": message,
+            "error_type": error_type,
+            "traceback": traceback_text,
+        }
+    )
+    st.session_state.debug_events = events[-100:]
 
 
 def _path_to_data_url(path: str) -> str:
@@ -395,11 +421,14 @@ Return exactly one token from ["1","2","3","4","5"].
 Scale:
 1 = very unlikely to produce an effective ad for this campaign
 2 = somewhat unlikely to produce an effective ad
-3 = mixed / uncertain
-4 = likely to produce an effective ad
-5 = highly likely to produce an effective ad
+3 = acceptable but ordinary, or not yet clearly strong for this campaign
+4 = strong, with clear evidence across most dimensions and no obvious weakness
+5 = exceptional, near-production-ready, and rare for this campaign
 
 Judge based on likely audience fit, clarity, visual specificity, brand-tone alignment, CTA support, and style adherence.
+Use 3 for prompts that seem serviceable but generic, incomplete, or not yet clearly compelling.
+Use 4 only when the prompt shows clear strength across most dimensions without an obvious weakness.
+Use 5 only for unusually strong prompts that are highly specific, cohesive, campaign-aligned, and likely to yield standout output.
 Do not explain your answer."""
 
     try:
@@ -461,11 +490,14 @@ Return exactly one token from ["1","2","3","4","5"].
 Scale:
 1 = ineffective and poorly aligned with the campaign
 2 = weak and unlikely to engage the target audience
-3 = mixed / uncertain effectiveness
-4 = strong and likely to engage the target audience
-5 = excellent fit and highly likely to perform well
+3 = acceptable but ordinary, or not yet clearly strong for this campaign
+4 = strong, with clear evidence across most dimensions and no obvious weakness
+5 = exceptional, near-production-ready, and rare for this campaign
 
 Judge based on overall ad effectiveness, audience fit, visual clarity, message delivery, CTA support, and style consistency.
+Use 3 for ads that are serviceable but generic, uneven, or missing clear strength.
+Use 4 only when the ad shows clear strength across most dimensions without an obvious weakness.
+Use 5 only for unusually strong ads that look standout, campaign-aligned, and close to production-ready.
 Do not explain your answer."""
 
     image_url = _path_to_data_url(image_path)
@@ -821,6 +853,7 @@ def _build_candidate_record(
     step: int | None = None,
     chain_id: int | None = None,
     trajectory_id: int | None = None,
+    debug_traceback: str | None = None,
 ) -> dict[str, Any]:
     """Create a consistent candidate record."""
     return {
@@ -842,6 +875,7 @@ def _build_candidate_record(
         "step": step,
         "chain_id": chain_id,
         "trajectory_id": trajectory_id,
+        "debug_traceback": debug_traceback,
     }
 
 
@@ -1425,6 +1459,16 @@ def _run_search_pipeline(
             try:
                 result = future.result()
             except Exception as exc:
+                traceback_text = _format_exception_traceback(exc)
+                _record_debug_event(
+                    "initial-worker",
+                    (
+                        f"Initial candidate {idx}/{len(prompt_variants)} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    error_type=type(exc).__name__,
+                    traceback_text=traceback_text,
+                )
                 result = {
                     "candidate_idx": idx,
                     "total_candidates": len(prompt_variants),
@@ -1437,6 +1481,7 @@ def _run_search_pipeline(
                         source="initial",
                         error=f"Initial candidate failed: {exc}",
                         score_mode="worker-exception",
+                        debug_traceback=traceback_text,
                     ),
                 }
 
@@ -1451,6 +1496,18 @@ def _run_search_pipeline(
     ranked_initial = _rank_candidates_desc(initial_candidates)
     successful_initial = [item for item in initial_candidates if item.get("output_path")]
     if not successful_initial:
+        failed_initial = [item for item in initial_candidates if item.get("error")]
+        for entry in failed_initial[:10]:
+            _record_debug_event(
+                "initial-candidate",
+                f"{entry['candidate_id']} failed: {entry['error']}",
+                traceback_text=entry.get("debug_traceback"),
+            )
+        if len(failed_initial) > 10:
+            _record_debug_event(
+                "initial-candidate",
+                f"{len(failed_initial) - 10} additional initial candidate failures were omitted.",
+            )
         raise RuntimeError("All initial image generations failed.")
 
     worst_pool = sorted(successful_initial, key=lambda item: item["score"])[:lowest_prompt_count]
@@ -1569,6 +1626,9 @@ def _render_candidate_gallery(
                     st.image(candidate["output_path"], use_container_width=True)
                 else:
                     st.warning(candidate.get("error") or "Image generation failed.")
+                    if st.session_state.get("debug_mode") and candidate.get("debug_traceback"):
+                        with st.expander("Traceback", expanded=False):
+                            st.code(candidate["debug_traceback"], language="python")
                 with st.expander("Prompt", expanded=False):
                     st.code(candidate["prompt"], language="text")
                 st.caption(_render_probs(candidate["probs"]))
@@ -1597,6 +1657,11 @@ def _render_base_results(results: dict[str, Any]) -> None:
             st.markdown(f"**Seed prompt:** `{seed['candidate_id']}`")
             if seed.get("output_path"):
                 st.image(seed["output_path"], use_container_width=True)
+            elif seed.get("error"):
+                st.warning(seed["error"])
+                if st.session_state.get("debug_mode") and seed.get("debug_traceback"):
+                    with st.expander("Traceback", expanded=False):
+                        st.code(seed["debug_traceback"], language="python")
             st.code(seed["prompt"], language="text")
             if chain["steps"]:
                 _render_candidate_gallery(
@@ -1629,6 +1694,11 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                 )
                 if winner.get("output_path"):
                     st.image(winner["output_path"], use_container_width=True)
+                elif winner.get("error"):
+                    st.warning(winner["error"])
+                    if st.session_state.get("debug_mode") and winner.get("debug_traceback"):
+                        with st.expander("Traceback", expanded=False):
+                            st.code(winner["debug_traceback"], language="python")
                 with st.expander(f"Winning Prompt For Step {winner['step']}", expanded=False):
                     st.code(winner["prompt"], language="text")
                 if winner.get("strategy"):
@@ -1653,6 +1723,11 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
             st.markdown(f"**Seed prompt:** `{seed['candidate_id']}`")
             if seed.get("output_path"):
                 st.image(seed["output_path"], use_container_width=True)
+            elif seed.get("error"):
+                st.warning(seed["error"])
+                if st.session_state.get("debug_mode") and seed.get("debug_traceback"):
+                    with st.expander("Traceback", expanded=False):
+                        st.code(seed["debug_traceback"], language="python")
             st.code(seed["prompt"], language="text")
 
             for step_entry in trajectory["steps"]:
@@ -1665,6 +1740,11 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                 )
                 if step_entry.get("output_path"):
                     st.image(step_entry["output_path"], use_container_width=True)
+                elif step_entry.get("error"):
+                    st.warning(step_entry["error"])
+                    if st.session_state.get("debug_mode") and step_entry.get("debug_traceback"):
+                        with st.expander("Traceback", expanded=False):
+                            st.code(step_entry["debug_traceback"], language="python")
                 if step_entry.get("candidate_prompts"):
                     with st.expander(
                         f"Prompt Candidates For Step {step_entry['step']}",
@@ -1679,6 +1759,39 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                 st.code(step_entry["prompt"], language="text")
                 if step_entry.get("strategy"):
                     st.caption(step_entry["strategy"])
+
+
+def _render_run_diagnostics() -> None:
+    """Render persistent diagnostics for the latest run."""
+    last_error = st.session_state.get("last_error")
+    debug_mode = bool(st.session_state.get("debug_mode", False))
+    debug_events = st.session_state.get("debug_events", [])
+
+    if not last_error and not (debug_mode and debug_events):
+        return
+
+    st.divider()
+    st.subheader("Run Diagnostics")
+
+    if last_error:
+        st.error(
+            "Last run failed during "
+            f"`{last_error.get('stage', 'unknown')}`: "
+            f"{last_error.get('error_type', 'Error')}: {last_error.get('message', 'Unknown error')}"
+        )
+        if debug_mode and last_error.get("traceback"):
+            with st.expander("Latest Traceback", expanded=True):
+                st.code(last_error["traceback"], language="python")
+
+    if debug_mode and debug_events:
+        with st.expander("Debug Event Log", expanded=last_error is None):
+            for event in debug_events:
+                label = event["stage"]
+                if event.get("error_type"):
+                    label = f"{label} | {event['error_type']}"
+                st.markdown(f"**{label}**: {event['message']}")
+                if event.get("traceback"):
+                    st.code(event["traceback"], language="python")
 
 
 # ─── Page Config ───────────────────────────────────────────────
@@ -1900,10 +2013,20 @@ with st.sidebar:
         step=1,
     )
 
+    st.divider()
+    st.header("Diagnostics")
+    debug_mode = st.checkbox(
+        "Debug mode",
+        value=bool(st.session_state.get("debug_mode", False)),
+        help="Show detailed errors and tracebacks in the UI when a run fails.",
+    )
+    st.session_state.debug_mode = debug_mode
+
     sidebar_settings = {
         "model": model_label,
         "resolution": aspect_ratio if aspect_ratio != "auto" else "auto",
         "style_description": style_description,
+        "debug_mode": debug_mode,
     }
 
 # ─── Session State ─────────────────────────────────────────────
@@ -1928,6 +2051,15 @@ if "creative_brief" not in st.session_state:
 
 if "optimization_results" not in st.session_state:
     st.session_state.optimization_results = None
+
+if "debug_mode" not in st.session_state:
+    st.session_state.debug_mode = False
+
+if "last_error" not in st.session_state:
+    st.session_state.last_error = None
+
+if "debug_events" not in st.session_state:
+    st.session_state.debug_events = []
 
 if style_image_bytes:
     st.session_state.session_data["style_reference"] = STYLE_PRESETS[selected_style_key]["label"]
@@ -1989,6 +2121,9 @@ if (
 def _run_optimization() -> None:
     """Execute the prompt-search pipeline and persist results."""
     st.session_state.phase = "generating"
+    st.session_state.optimization_results = None
+    st.session_state.last_error = None
+    st.session_state.debug_events = []
 
     try:
         with st.chat_message("assistant"):
@@ -2018,6 +2153,7 @@ def _run_optimization() -> None:
                 status.update(label="Prompt search complete!", state="complete", expanded=False)
 
         st.session_state.optimization_results = results
+        st.session_state.last_error = None
         st.session_state.phase = "done"
         response_text = (
             "Search finished. The initial prompts, the lowest-performing seeds, and the "
@@ -2026,6 +2162,19 @@ def _run_optimization() -> None:
         st.session_state.messages.append({"role": "assistant", "content": response_text})
         st.rerun()
     except Exception as exc:
+        traceback_text = _format_exception_traceback(exc)
+        st.session_state.last_error = {
+            "stage": "optimization",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback_text,
+        }
+        _record_debug_event(
+            "optimization",
+            f"Search failed: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+            traceback_text=traceback_text,
+        )
         st.session_state.phase = "reviewing"
         error_text = f"Search failed: {exc}"
         st.session_state.messages.append({"role": "assistant", "content": error_text})
@@ -2187,6 +2336,8 @@ if st.session_state.optimization_results:
         _render_base_results(results["base"])
     with tabs[3]:
         _render_efficient_results(results["efficient"])
+
+_render_run_diagnostics()
 
 with st.sidebar:
     st.divider()
