@@ -1,6 +1,7 @@
 """Streamlit app for prompt-search-based ad generation."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import mimetypes
@@ -26,6 +27,9 @@ DEFAULT_LOWEST_PROMPTS = 5
 DEFAULT_OPTIMIZATION_STEPS = 10
 DEFAULT_EFFICIENT_CANDIDATES = 2
 DEFAULT_JUDGE_REPEATS = 1
+DEFAULT_INITIAL_PARALLELISM = 10
+DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM = 10
+DEFAULT_EFFICIENT_PRESCORE_PARALLELISM = 10
 
 
 def _one_hot_probs(selected: str | None) -> dict[str, float]:
@@ -830,6 +834,229 @@ def _build_candidate_record(
     }
 
 
+def _evaluate_initial_candidate(
+    *,
+    candidate_idx: int,
+    total_candidates: int,
+    prompt: str,
+    openai_client,
+    gemini_key: str,
+    model_key: str,
+    aspect_ratio: str,
+    gpt_image_quality: str,
+    style_image_bytes: bytes | None,
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    judge_repeats: int,
+) -> dict[str, Any]:
+    """Generate and score one initial candidate."""
+    output_path, error = _generate_image_for_prompt(
+        client=openai_client,
+        gemini_key=gemini_key,
+        model_key=model_key,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        gpt_image_quality=gpt_image_quality,
+        style_image_bytes=style_image_bytes,
+    )
+
+    if output_path:
+        scored = _aggregate_soft_scores(
+            lambda seed_value: _score_image_with_logprobs(
+                openai_client,
+                output_path,
+                prompt,
+                session_data,
+                sidebar_settings,
+                creative_brief,
+                seed=seed_value,
+            ),
+            repeats=judge_repeats,
+            seed_base=candidate_idx * 100,
+        )
+        score = scored["score"]
+        probs = scored["probs"]
+    else:
+        score = 1.0
+        probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+
+    return {
+        "candidate_idx": candidate_idx,
+        "total_candidates": total_candidates,
+        "record": _build_candidate_record(
+            candidate_id=f"initial_{candidate_idx:02d}",
+            prompt=prompt,
+            output_path=output_path,
+            score=score,
+            probs=probs,
+            source="initial",
+            error=error,
+        ),
+    }
+
+
+def _prescore_efficient_candidate(
+    *,
+    candidate_prompt: str,
+    candidate_idx: int,
+    trajectory_id: int,
+    step: int,
+    openai_client,
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    judge_repeats: int,
+) -> dict[str, Any]:
+    """Pre-score one efficient-search prompt candidate."""
+    prompt_scored = _aggregate_soft_scores(
+        lambda seed_value: _score_prompt_with_logprobs(
+            openai_client,
+            candidate_prompt,
+            session_data,
+            sidebar_settings,
+            creative_brief,
+            seed=seed_value,
+        ),
+        repeats=judge_repeats,
+        seed_base=step * 10000 + trajectory_id * 100 + candidate_idx,
+    )
+    return {
+        "prompt": candidate_prompt,
+        "score": prompt_scored["score"],
+        "probs": prompt_scored["probs"],
+    }
+
+
+def _run_efficient_trajectory_step(
+    *,
+    openai_client,
+    gemini_key: str,
+    model_key: str,
+    aspect_ratio: str,
+    gpt_image_quality: str,
+    style_image_bytes: bytes | None,
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    trajectory: dict[str, Any],
+    step: int,
+    efficient_candidates: int,
+    judge_repeats: int,
+    shared_history_snapshot: list[dict[str, Any]],
+    shared_reflection: str,
+) -> dict[str, Any]:
+    """Run one efficient-search trajectory step against a shared snapshot."""
+    current = trajectory["current"]
+    proposals = _generate_efficient_candidates(
+        openai_client,
+        current["prompt"],
+        current["score"],
+        session_data,
+        sidebar_settings,
+        creative_brief,
+        shared_history_snapshot,
+        shared_reflection,
+        candidate_count=efficient_candidates,
+    )
+
+    prescored_candidates: list[dict[str, Any]] = []
+    prescore_parallelism = min(
+        DEFAULT_EFFICIENT_PRESCORE_PARALLELISM,
+        max(1, len(proposals["prompts"])),
+    )
+    with ThreadPoolExecutor(max_workers=prescore_parallelism) as executor:
+        future_to_idx = {
+            executor.submit(
+                _prescore_efficient_candidate,
+                candidate_prompt=candidate_prompt,
+                candidate_idx=cand_idx,
+                trajectory_id=trajectory["trajectory_id"],
+                step=step,
+                openai_client=openai_client,
+                session_data=session_data,
+                sidebar_settings=sidebar_settings,
+                creative_brief=creative_brief,
+                judge_repeats=judge_repeats,
+            ): cand_idx
+            for cand_idx, candidate_prompt in enumerate(proposals["prompts"], start=1)
+        }
+
+        completed_prescores: list[dict[str, Any]] = []
+        for future in as_completed(future_to_idx):
+            cand_idx = future_to_idx[future]
+            result = future.result()
+            completed_prescores.append(
+                {
+                    "candidate_idx": cand_idx,
+                    "candidate": result,
+                }
+            )
+
+    completed_prescores.sort(key=lambda item: item["candidate_idx"])
+    prescored_candidates = [item["candidate"] for item in completed_prescores]
+
+    selected_prompt_entry = max(prescored_candidates, key=lambda item: item["score"])
+    selected_prompt = selected_prompt_entry["prompt"]
+
+    output_path, error = _generate_image_for_prompt(
+        client=openai_client,
+        gemini_key=gemini_key,
+        model_key=model_key,
+        prompt=selected_prompt,
+        aspect_ratio=aspect_ratio,
+        gpt_image_quality=gpt_image_quality,
+        style_image_bytes=style_image_bytes,
+    )
+
+    if output_path:
+        image_scored = _aggregate_soft_scores(
+            lambda seed_value: _score_image_with_logprobs(
+                openai_client,
+                output_path,
+                selected_prompt,
+                session_data,
+                sidebar_settings,
+                creative_brief,
+                seed=seed_value,
+            ),
+            repeats=judge_repeats,
+            seed_base=step * 20000 + trajectory["trajectory_id"] * 100,
+        )
+        final_score = image_scored["score"]
+        final_probs = image_scored["probs"]
+    else:
+        final_score = 1.0
+        final_probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+
+    accepted = final_score > current["score"]
+    step_entry = _build_candidate_record(
+        candidate_id=f"efficient_traj{trajectory['trajectory_id']:02d}_step{step:02d}",
+        prompt=selected_prompt,
+        output_path=output_path,
+        score=final_score,
+        probs=final_probs,
+        source="efficient",
+        error=error,
+        prompt_prescore=selected_prompt_entry["score"],
+        prompt_prescore_probs=selected_prompt_entry["probs"],
+        strategy=proposals.get("strategy"),
+        accepted=accepted,
+        start_seed_id=trajectory["seed"]["candidate_id"],
+        start_seed_rank=trajectory["seed"].get("worst_rank"),
+        step=step,
+        trajectory_id=trajectory["trajectory_id"],
+    )
+    step_entry["candidate_prompts"] = prescored_candidates
+    step_entry["shared_reflection"] = shared_reflection
+
+    return {
+        "trajectory_id": trajectory["trajectory_id"],
+        "step_entry": step_entry,
+        "accepted": accepted,
+    }
+
+
 def _rank_candidates_desc(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort candidates by score descending."""
     return sorted(candidates, key=lambda item: item.get("score", 0.0), reverse=True)
@@ -964,12 +1191,14 @@ def _run_efficient_optimizer(
     efficient_candidates: int,
     judge_repeats: int,
     report,
+    report_image=None,
 ) -> dict[str, Any]:
     """Run the shared-history efficient optimizer from the same worst seeds."""
     trajectories: list[dict[str, Any]] = []
     shared_history: list[dict[str, Any]] = [dict(seed) for seed in worst_seeds]
     shared_reflection = _generate_shared_reflection(openai_client, shared_history)
     all_evaluated: list[dict[str, Any]] = []
+    step_winners: list[dict[str, Any]] = []
     shared_reflection_history = [
         {"step": 0, "reflection": shared_reflection, "history_size": len(shared_history)}
     ]
@@ -985,111 +1214,94 @@ def _run_efficient_optimizer(
             }
         )
 
+    trajectory_parallelism = min(
+        DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM,
+        max(1, len(trajectories)),
+    )
+    report(
+        f"Efficient optimizer running {len(trajectories)} trajectories with up to "
+        f"{trajectory_parallelism} parallel workers per step"
+    )
+
     for step in range(1, optimization_steps + 1):
         report(
             f"Efficient step {step}/{optimization_steps}: shared reflection refreshed across "
             f"{len(shared_history)} evaluated prompts"
         )
 
-        for trajectory in trajectories:
-            current = trajectory["current"]
-            proposals = _generate_efficient_candidates(
-                openai_client,
-                current["prompt"],
-                current["score"],
-                session_data,
-                sidebar_settings,
-                creative_brief,
-                shared_history,
-                shared_reflection,
-                candidate_count=efficient_candidates,
-            )
+        shared_history_snapshot = [dict(item) for item in shared_history]
+        trajectory_by_id = {trajectory["trajectory_id"]: trajectory for trajectory in trajectories}
+        with ThreadPoolExecutor(max_workers=trajectory_parallelism) as executor:
+            future_to_trajectory = {
+                executor.submit(
+                    _run_efficient_trajectory_step,
+                    openai_client=openai_client,
+                    gemini_key=gemini_key,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                    gpt_image_quality=gpt_image_quality,
+                    style_image_bytes=style_image_bytes,
+                    session_data=session_data,
+                    sidebar_settings=sidebar_settings,
+                    creative_brief=creative_brief,
+                    trajectory={
+                        "trajectory_id": trajectory["trajectory_id"],
+                        "seed": trajectory["seed"],
+                        "current": dict(trajectory["current"]),
+                    },
+                    step=step,
+                    efficient_candidates=efficient_candidates,
+                    judge_repeats=judge_repeats,
+                    shared_history_snapshot=shared_history_snapshot,
+                    shared_reflection=shared_reflection,
+                ): trajectory["trajectory_id"]
+                for trajectory in trajectories
+            }
 
-            prescored_candidates: list[dict[str, Any]] = []
-            for cand_idx, candidate_prompt in enumerate(proposals["prompts"], start=1):
-                prompt_scored = _aggregate_soft_scores(
-                    lambda seed_value: _score_prompt_with_logprobs(
-                        openai_client,
-                        candidate_prompt,
-                        session_data,
-                        sidebar_settings,
-                        creative_brief,
-                        seed=seed_value,
-                    ),
-                    repeats=judge_repeats,
-                    seed_base=step * 10000 + trajectory["trajectory_id"] * 100 + cand_idx,
-                )
-                prescored_candidates.append(
-                    {
-                        "prompt": candidate_prompt,
-                        "score": prompt_scored["score"],
-                        "probs": prompt_scored["probs"],
-                    }
-                )
+            step_results: list[dict[str, Any]] = []
+            for future in as_completed(future_to_trajectory):
+                step_results.append(future.result())
 
-            selected_prompt_entry = max(prescored_candidates, key=lambda item: item["score"])
-            selected_prompt = selected_prompt_entry["prompt"]
-
-            output_path, error = _generate_image_for_prompt(
-                client=openai_client,
-                gemini_key=gemini_key,
-                model_key=model_key,
-                prompt=selected_prompt,
-                aspect_ratio=aspect_ratio,
-                gpt_image_quality=gpt_image_quality,
-                style_image_bytes=style_image_bytes,
-            )
-
-            if output_path:
-                image_scored = _aggregate_soft_scores(
-                    lambda seed_value: _score_image_with_logprobs(
-                        openai_client,
-                        output_path,
-                        selected_prompt,
-                        session_data,
-                        sidebar_settings,
-                        creative_brief,
-                        seed=seed_value,
-                    ),
-                    repeats=judge_repeats,
-                    seed_base=step * 20000 + trajectory["trajectory_id"] * 100,
-                )
-                final_score = image_scored["score"]
-                final_probs = image_scored["probs"]
-            else:
-                final_score = 1.0
-                final_probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
-
-            accepted = final_score > current["score"]
-            step_entry = _build_candidate_record(
-                candidate_id=(
-                    f"efficient_traj{trajectory['trajectory_id']:02d}_step{step:02d}"
-                ),
-                prompt=selected_prompt,
-                output_path=output_path,
-                score=final_score,
-                probs=final_probs,
-                source="efficient",
-                error=error,
-                prompt_prescore=selected_prompt_entry["score"],
-                prompt_prescore_probs=selected_prompt_entry["probs"],
-                strategy=proposals.get("strategy"),
-                accepted=accepted,
-                start_seed_id=trajectory["seed"]["candidate_id"],
-                start_seed_rank=trajectory["seed"].get("worst_rank"),
-                step=step,
-                trajectory_id=trajectory["trajectory_id"],
-            )
-            step_entry["candidate_prompts"] = prescored_candidates
-            step_entry["shared_reflection"] = shared_reflection
+        step_results.sort(key=lambda item: item["trajectory_id"])
+        for result in step_results:
+            trajectory = trajectory_by_id[result["trajectory_id"]]
+            step_entry = result["step_entry"]
             trajectory["steps"].append(step_entry)
             shared_history.append(step_entry)
             all_evaluated.append(step_entry)
 
-            if accepted:
+            if result["accepted"]:
                 trajectory["current"] = dict(step_entry)
-            if final_score > trajectory["best"]["score"]:
+            if step_entry["score"] > trajectory["best"]["score"]:
                 trajectory["best"] = dict(step_entry)
+
+        step_winner_result = max(step_results, key=lambda item: item["step_entry"]["score"])
+        step_winner_entry = step_winner_result["step_entry"]
+        step_winner = {
+            "step": step,
+            "trajectory_id": step_winner_result["trajectory_id"],
+            "score": step_winner_entry["score"],
+            "prompt_prescore": step_winner_entry.get("prompt_prescore"),
+            "output_path": step_winner_entry.get("output_path"),
+            "prompt": step_winner_entry["prompt"],
+            "strategy": step_winner_entry.get("strategy"),
+            "candidate_id": step_winner_entry["candidate_id"],
+        }
+        step_winners.append(step_winner)
+        report(
+            f"Efficient step {step}/{optimization_steps} winner: trajectory "
+            f"{step_winner['trajectory_id']} | pre-score "
+            f"{(step_winner['prompt_prescore'] or 0.0):.3f} | "
+            f"final score {step_winner['score']:.3f}"
+        )
+        if report_image and step_winner.get("output_path"):
+            report_image(
+                step_winner["output_path"],
+                caption=(
+                    f"Efficient step {step} winner | trajectory {step_winner['trajectory_id']} | "
+                    f"score {step_winner['score']:.3f}"
+                ),
+            )
 
         shared_reflection = _generate_shared_reflection(openai_client, shared_history)
         shared_reflection_history.append(
@@ -1105,6 +1317,7 @@ def _run_efficient_optimizer(
         "trajectories": trajectories,
         "all_evaluated": all_evaluated,
         "best": best_overall,
+        "step_winners": step_winners,
         "shared_reflection_history": shared_reflection_history,
     }
 
@@ -1126,6 +1339,7 @@ def _run_search_pipeline(
     efficient_candidates: int,
     judge_repeats: int,
     report,
+    report_image=None,
 ) -> dict[str, Any]:
     """Run the full prompt-search pipeline."""
     base_prompt = build_generation_prompt(
@@ -1148,49 +1362,63 @@ def _run_search_pipeline(
     report(f"Prepared {len(prompt_variants)} initial prompt candidates")
 
     initial_candidates: list[dict[str, Any]] = []
-    for idx, prompt in enumerate(prompt_variants, start=1):
-        report(f"Initial candidate {idx}/{len(prompt_variants)}: generating image")
-        output_path, error = _generate_image_for_prompt(
-            client=openai_client,
-            gemini_key=gemini_key,
-            model_key=model_key,
-            prompt=prompt,
-            aspect_ratio=aspect_ratio,
-            gpt_image_quality=gpt_image_quality,
-            style_image_bytes=style_image_bytes,
-        )
+    initial_parallelism = min(
+        DEFAULT_INITIAL_PARALLELISM,
+        max(1, len(prompt_variants)),
+    )
+    report(
+        f"Running {len(prompt_variants)} initial candidates with up to "
+        f"{initial_parallelism} parallel workers"
+    )
 
-        if output_path:
-            scored = _aggregate_soft_scores(
-                lambda seed_value: _score_image_with_logprobs(
-                    openai_client,
-                    output_path,
-                    prompt,
-                    session_data,
-                    sidebar_settings,
-                    creative_brief,
-                    seed=seed_value,
-                ),
-                repeats=judge_repeats,
-                seed_base=idx * 100,
-            )
-            score = scored["score"]
-            probs = scored["probs"]
-        else:
-            score = 1.0
-            probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
-
-        initial_candidates.append(
-            _build_candidate_record(
-                candidate_id=f"initial_{idx:02d}",
+    with ThreadPoolExecutor(max_workers=initial_parallelism) as executor:
+        future_to_idx = {
+            executor.submit(
+                _evaluate_initial_candidate,
+                candidate_idx=idx,
+                total_candidates=len(prompt_variants),
                 prompt=prompt,
-                output_path=output_path,
-                score=score,
-                probs=probs,
-                source="initial",
-                error=error,
+                openai_client=openai_client,
+                gemini_key=gemini_key,
+                model_key=model_key,
+                aspect_ratio=aspect_ratio,
+                gpt_image_quality=gpt_image_quality,
+                style_image_bytes=style_image_bytes,
+                session_data=session_data,
+                sidebar_settings=sidebar_settings,
+                creative_brief=creative_brief,
+                judge_repeats=judge_repeats,
+            ): idx
+            for idx, prompt in enumerate(prompt_variants, start=1)
+        }
+
+        completed_candidates: list[dict[str, Any]] = []
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "candidate_idx": idx,
+                    "total_candidates": len(prompt_variants),
+                    "record": _build_candidate_record(
+                        candidate_id=f"initial_{idx:02d}",
+                        prompt=prompt_variants[idx - 1],
+                        output_path=None,
+                        score=1.0,
+                        probs={str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)},
+                        source="initial",
+                        error=f"Initial candidate failed: {exc}",
+                    ),
+                }
+
+            completed_candidates.append(result)
+            report(
+                f"Initial candidate {result['candidate_idx']}/{result['total_candidates']}: complete"
             )
-        )
+
+    completed_candidates.sort(key=lambda item: item["candidate_idx"])
+    initial_candidates = [item["record"] for item in completed_candidates]
 
     ranked_initial = _rank_candidates_desc(initial_candidates)
     successful_initial = [item for item in initial_candidates if item.get("output_path")]
@@ -1236,6 +1464,7 @@ def _run_search_pipeline(
         efficient_candidates=efficient_candidates,
         judge_repeats=judge_repeats,
         report=report,
+        report_image=report_image,
     )
 
     overall_best = max(
@@ -1346,6 +1575,22 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
     st.markdown(
         f"Best efficient result: **{best['score']:.3f}** from seed `{best.get('start_seed_id', 'n/a')}`."
     )
+
+    if results.get("step_winners"):
+        with st.expander("Step Winners", expanded=False):
+            for winner in results["step_winners"]:
+                st.markdown(
+                    f"**Step {winner['step']}** | "
+                    f"trajectory {winner['trajectory_id']} | "
+                    f"pre-score {(winner.get('prompt_prescore') or 0.0):.3f} | "
+                    f"final score {winner['score']:.3f}"
+                )
+                if winner.get("output_path"):
+                    st.image(winner["output_path"], use_container_width=True)
+                with st.expander(f"Winning Prompt For Step {winner['step']}", expanded=False):
+                    st.code(winner["prompt"], language="text")
+                if winner.get("strategy"):
+                    st.caption(winner["strategy"])
 
     with st.expander("Shared Reflections", expanded=False):
         for item in results["shared_reflection_history"]:
@@ -1703,6 +1948,10 @@ def _run_optimization() -> None:
     try:
         with st.chat_message("assistant"):
             with st.status("Running prompt search...", expanded=True) as status:
+                def _status_report_image(image_path: str, caption: str | None = None) -> None:
+                    if image_path:
+                        st.image(image_path, caption=caption, use_container_width=True)
+
                 results = _run_search_pipeline(
                     openai_client=openai_client,
                     gemini_key=gemini_key,
@@ -1719,6 +1968,7 @@ def _run_optimization() -> None:
                     efficient_candidates=int(efficient_candidates),
                     judge_repeats=DEFAULT_JUDGE_REPEATS,
                     report=st.write,
+                    report_image=_status_report_image,
                 )
                 status.update(label="Prompt search complete!", state="complete", expanded=False)
 
