@@ -29,8 +29,16 @@ DEFAULT_OPTIMIZATION_STEPS = 10
 DEFAULT_EFFICIENT_CANDIDATES = 2
 DEFAULT_JUDGE_REPEATS = 1
 DEFAULT_INITIAL_PARALLELISM = 10
+DEFAULT_BASE_CHAIN_PARALLELISM = 10
 DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM = 10
 DEFAULT_EFFICIENT_PRESCORE_PARALLELISM = 10
+JUDGE_CALIBRATION = """Calibration:
+Score relative to professional paid ads, not relative to ordinary AI outputs.
+Most acceptable candidates should receive 2 or 3.
+Use 4 only for approximately top 10% production-ready ads.
+Use 5 only for top 1% exceptional ads that need almost no revision.
+If uncertain between two scores, choose the lower score.
+Penalize generic product staging, vague audience fit, weak CTA visibility, unreadable text, artificial-looking composition, or missing brand distinctiveness."""
 
 
 def _failure_probs() -> dict[str, float]:
@@ -425,6 +433,8 @@ Scale:
 4 = strong, with clear evidence across most dimensions and no obvious weakness
 5 = exceptional, near-production-ready, and rare for this campaign
 
+{JUDGE_CALIBRATION}
+
 Judge based on likely audience fit, clarity, visual specificity, brand-tone alignment, CTA support, and style adherence.
 Use 3 for prompts that seem serviceable but generic, incomplete, or not yet clearly compelling.
 Use 4 only when the prompt shows clear strength across most dimensions without an obvious weakness.
@@ -493,6 +503,8 @@ Scale:
 3 = acceptable but ordinary, or not yet clearly strong for this campaign
 4 = strong, with clear evidence across most dimensions and no obvious weakness
 5 = exceptional, near-production-ready, and rare for this campaign
+
+{JUDGE_CALIBRATION}
 
 Judge based on overall ad effectiveness, audience fit, visual clarity, message delivery, CTA support, and style consistency.
 Use 3 for ads that are serviceable but generic, uneven, or missing clear strength.
@@ -1115,6 +1127,105 @@ def _rank_candidates_desc(candidates: list[dict[str, Any]]) -> list[dict[str, An
     return sorted(candidates, key=lambda item: item.get("score", 0.0), reverse=True)
 
 
+def _run_base_optimizer_chain(
+    *,
+    openai_client,
+    gemini_key: str,
+    model_key: str,
+    aspect_ratio: str,
+    gpt_image_quality: str,
+    style_image_bytes: bytes | None,
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    seed: dict[str, Any],
+    chain_idx: int,
+    optimization_steps: int,
+    judge_repeats: int,
+) -> dict[str, Any]:
+    """Run one base optimization chain from a single starting seed."""
+    current = dict(seed)
+    best = dict(seed)
+    chain_history = [dict(seed)]
+    step_entries: list[dict[str, Any]] = []
+
+    for step in range(1, optimization_steps + 1):
+        revision = _generate_base_revision(
+            openai_client,
+            current["prompt"],
+            current["score"],
+            session_data,
+            sidebar_settings,
+            creative_brief,
+            chain_history,
+        )
+        new_prompt = revision["prompt"]
+        output_path, error = _generate_image_for_prompt(
+            client=openai_client,
+            gemini_key=gemini_key,
+            model_key=model_key,
+            prompt=new_prompt,
+            aspect_ratio=aspect_ratio,
+            gpt_image_quality=gpt_image_quality,
+            style_image_bytes=style_image_bytes,
+        )
+
+        if output_path:
+            scored = _aggregate_soft_scores(
+                lambda seed_value: _score_image_with_logprobs(
+                    openai_client,
+                    output_path,
+                    new_prompt,
+                    session_data,
+                    sidebar_settings,
+                    creative_brief,
+                    seed=seed_value,
+                ),
+                repeats=judge_repeats,
+                seed_base=chain_idx * 1000 + step * 10,
+            )
+            score = scored["score"]
+            probs = scored["probs"]
+            score_mode = scored.get("mode")
+        else:
+            score = 1.0
+            probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+            score_mode = "image-generation-failed"
+
+        accepted = score > current["score"]
+        step_entry = _build_candidate_record(
+            candidate_id=f"base_chain{chain_idx:02d}_step{step:02d}",
+            prompt=new_prompt,
+            output_path=output_path,
+            score=score,
+            probs=probs,
+            source="base",
+            error=error,
+            score_mode=score_mode,
+            strategy=revision.get("strategy"),
+            accepted=accepted,
+            start_seed_id=seed["candidate_id"],
+            start_seed_rank=seed.get("worst_rank"),
+            step=step,
+            chain_id=chain_idx,
+        )
+        step_entries.append(step_entry)
+        chain_history.append(step_entry)
+
+        if accepted:
+            current = dict(step_entry)
+        if score > best["score"]:
+            best = dict(step_entry)
+
+    return {
+        "chain_id": chain_idx,
+        "seed": seed,
+        "steps": step_entries,
+        "final": current,
+        "best": best,
+    }
+
+
 def _run_base_optimizer(
     *,
     openai_client,
@@ -1133,95 +1244,60 @@ def _run_base_optimizer(
 ) -> dict[str, Any]:
     """Run the base optimization chains independently from the worst seeds."""
     chains: list[dict[str, Any]] = []
-    all_evaluated: list[dict[str, Any]] = []
 
-    for chain_idx, seed in enumerate(worst_seeds, start=1):
-        report(
-            f"Base chain {chain_idx}/{len(worst_seeds)}: starting from score {seed['score']:.3f}"
-        )
-        current = dict(seed)
-        best = dict(seed)
-        chain_history = [dict(seed)]
-        step_entries: list[dict[str, Any]] = []
+    chain_parallelism = min(DEFAULT_BASE_CHAIN_PARALLELISM, max(1, len(worst_seeds)))
+    report(
+        f"Base optimizer running {len(worst_seeds)} chains with up to "
+        f"{chain_parallelism} parallel workers"
+    )
 
-        for step in range(1, optimization_steps + 1):
-            revision = _generate_base_revision(
-                openai_client,
-                current["prompt"],
-                current["score"],
-                session_data,
-                sidebar_settings,
-                creative_brief,
-                chain_history,
-            )
-            new_prompt = revision["prompt"]
-            output_path, error = _generate_image_for_prompt(
-                client=openai_client,
+    with ThreadPoolExecutor(max_workers=chain_parallelism) as executor:
+        future_to_chain = {
+            executor.submit(
+                _run_base_optimizer_chain,
+                openai_client=openai_client,
                 gemini_key=gemini_key,
                 model_key=model_key,
-                prompt=new_prompt,
                 aspect_ratio=aspect_ratio,
                 gpt_image_quality=gpt_image_quality,
                 style_image_bytes=style_image_bytes,
-            )
+                session_data=session_data,
+                sidebar_settings=sidebar_settings,
+                creative_brief=creative_brief,
+                seed=seed,
+                chain_idx=chain_idx,
+                optimization_steps=optimization_steps,
+                judge_repeats=judge_repeats,
+            ): chain_idx
+            for chain_idx, seed in enumerate(worst_seeds, start=1)
+        }
 
-            if output_path:
-                scored = _aggregate_soft_scores(
-                    lambda seed_value: _score_image_with_logprobs(
-                        openai_client,
-                        output_path,
-                        new_prompt,
-                        session_data,
-                        sidebar_settings,
-                        creative_brief,
-                        seed=seed_value,
-                    ),
-                    repeats=judge_repeats,
-                    seed_base=chain_idx * 1000 + step * 10,
+        for future in as_completed(future_to_chain):
+            chain_idx = future_to_chain[future]
+            try:
+                chain = future.result()
+            except Exception as exc:
+                traceback_text = _format_exception_traceback(exc)
+                _record_debug_event(
+                    "base-chain",
+                    f"Base chain {chain_idx}/{len(worst_seeds)} failed: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                    traceback_text=traceback_text,
                 )
-                score = scored["score"]
-                probs = scored["probs"]
-                score_mode = scored.get("mode")
-            else:
-                score = 1.0
-                probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
-                score_mode = "image-generation-failed"
+                raise RuntimeError(f"Base chain {chain_idx} failed: {exc}") from exc
 
-            accepted = score > current["score"]
-            step_entry = _build_candidate_record(
-                candidate_id=f"base_chain{chain_idx:02d}_step{step:02d}",
-                prompt=new_prompt,
-                output_path=output_path,
-                score=score,
-                probs=probs,
-                source="base",
-                error=error,
-                score_mode=score_mode,
-                strategy=revision.get("strategy"),
-                accepted=accepted,
-                start_seed_id=seed["candidate_id"],
-                start_seed_rank=seed.get("worst_rank"),
-                step=step,
-                chain_id=chain_idx,
+            chains.append(chain)
+            report(
+                f"Base chain {chain_idx}/{len(worst_seeds)} complete: best score "
+                f"{_format_score(chain['best']['score'])}"
             )
-            step_entries.append(step_entry)
-            chain_history.append(step_entry)
-            all_evaluated.append(step_entry)
 
-            if accepted:
-                current = dict(step_entry)
-            if score > best["score"]:
-                best = dict(step_entry)
-
-        chains.append(
-            {
-                "chain_id": chain_idx,
-                "seed": seed,
-                "steps": step_entries,
-                "final": current,
-                "best": best,
-            }
-        )
+    chains.sort(key=lambda chain: chain["chain_id"])
+    all_evaluated = [
+        step_entry
+        for chain in chains
+        for step_entry in chain["steps"]
+    ]
 
     best_overall = max([chain["best"] for chain in chains], key=lambda item: item["score"])
     return {
