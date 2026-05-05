@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import random
 import traceback
 from typing import Any
 
@@ -27,18 +28,32 @@ DEFAULT_INITIAL_PROMPTS = 10
 DEFAULT_LOWEST_PROMPTS = 5
 DEFAULT_OPTIMIZATION_STEPS = 10
 DEFAULT_EFFICIENT_CANDIDATES = 2
+DEFAULT_TEXTBO_GRADIENT_STEPS = 2
+HIDDEN_BASELINE_CANDIDATES = 1
+HIDDEN_BASELINE_GRADIENT_STEPS = 1
 DEFAULT_JUDGE_REPEATS = 1
+DEFAULT_PERSONA_COUNT = 1
+MAX_PERSONA_FILES = 5
+MAX_PERSONA_CHARS = 50000
+PERSONA_DIR = os.path.join(os.path.dirname(__file__), "persona")
+TOURNAMENT_COMPARISONS = 3
 DEFAULT_INITIAL_PARALLELISM = 10
 DEFAULT_BASE_CHAIN_PARALLELISM = 10
 DEFAULT_EFFICIENT_TRAJECTORY_PARALLELISM = 10
 DEFAULT_EFFICIENT_PRESCORE_PARALLELISM = 10
 JUDGE_CALIBRATION = """Calibration:
 Score relative to professional paid ads, not relative to ordinary AI outputs.
-Most acceptable candidates should receive 2 or 3.
-Use 4 only for approximately top 10% production-ready ads.
-Use 5 only for top 1% exceptional ads that need almost no revision.
+Treat 3 as the default ceiling for ads that are merely usable, attractive, or coherent.
+Score 4 only when the ad is production-ready, campaign-specific, and has no major weakness.
+Score 5 only for rare exceptional ads that are clearly stronger than most professional paid ads.
 If uncertain between two scores, choose the lower score.
+If the ad is attractive but generic, score at most 3.
+If the product, message, audience fit, or CTA is unclear, score at most 3.
+If requested text appears unreadable, distorted, or missing, score at most 2.
 Penalize generic product staging, vague audience fit, weak CTA visibility, unreadable text, artificial-looking composition, or missing brand distinctiveness."""
+
+
+_PERSONA_CACHE: list[dict[str, str]] | None = None
 
 
 def _failure_probs() -> dict[str, float]:
@@ -117,6 +132,27 @@ def _request_json_object(
     return _parse_json_text(response.choices[0].message.content or "{}")
 
 
+def _request_text(
+    client,
+    system_prompt: str,
+    user_prompt: str | list[dict[str, Any]],
+    *,
+    temperature: float = 1.0,
+    max_completion_tokens: int = 4096,
+) -> str:
+    """Request plain text from GPT-5-nano."""
+    response = client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        max_completion_tokens=max_completion_tokens,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 def _prompt_excerpt(prompt: str, max_chars: int = 180) -> str:
     """Short prompt preview for UI and meta-reflection."""
     compact = " ".join((prompt or "").split())
@@ -178,6 +214,46 @@ def _path_to_data_url(path: str) -> str:
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     return f"data:image/{subtype};base64,{encoded}"
+
+
+def _load_personas() -> list[dict[str, str]]:
+    """Load the fixed five local personas used for TextBO evaluation."""
+    global _PERSONA_CACHE
+    if _PERSONA_CACHE is not None:
+        return _PERSONA_CACHE
+
+    personas: list[dict[str, str]] = []
+    if not os.path.isdir(PERSONA_DIR):
+        _PERSONA_CACHE = []
+        return _PERSONA_CACHE
+
+    persona_files = sorted(
+        os.path.join(PERSONA_DIR, filename)
+        for filename in os.listdir(PERSONA_DIR)
+        if filename.startswith("pid_") and filename.endswith("_mega_persona.txt")
+    )
+    for path in persona_files[:MAX_PERSONA_FILES]:
+        filename = os.path.basename(path)
+        parts = filename.split("_")
+        persona_id = parts[1] if len(parts) > 1 else filename
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError:
+            continue
+        if text:
+            personas.append({"persona_id": persona_id, "text": text, "path": path})
+
+    _PERSONA_CACHE = personas
+    return _PERSONA_CACHE
+
+
+def _persona_sample_text(persona: dict[str, str]) -> str:
+    """Return a bounded persona text sample for judge prompts."""
+    text = persona.get("text", "")
+    if len(text) <= MAX_PERSONA_CHARS:
+        return text
+    return text[:MAX_PERSONA_CHARS] + "\n\n[Note: Content truncated]"
 
 
 def _campaign_context_text(
@@ -309,10 +385,10 @@ def _reflection_examples(
 def _build_multimodal_reflection_content(
     candidates: list[dict[str, Any]],
     *,
-    top_n: int = 4,
-    bottom_n: int = 4,
+    top_n: int = 5,
+    bottom_n: int = 5,
 ) -> list[dict[str, Any]]:
-    """Build multimodal reflection content from ranked prompt/image history."""
+    """Build reference-style visual pattern analysis content from history."""
     examples = _reflection_examples(candidates, top_n=top_n, bottom_n=bottom_n)
     if not examples:
         return []
@@ -321,14 +397,11 @@ def _build_multimodal_reflection_content(
         {
             "type": "text",
             "text": (
-                "You are analyzing historical ad optimization results for one campaign.\n\n"
-                "You will receive lower-performing and higher-performing examples. Each "
-                "example includes an overall rank, score, prompt excerpt, and the rendered "
-                "ad image when available.\n\n"
-                "Infer visual and prompt-level patterns that tend to help or hurt performance. "
-                "Focus on actionable differences between strong and weak ads.\n\n"
-                'Return JSON with one key: "reflection". The reflection should be one short '
-                "paragraph."
+                "You are an expert at analyzing visual patterns in advertising performance.\n\n"
+                "VISUAL ANALYSIS TASK: I will show you images from the lowest-scoring and "
+                "highest-scoring ad iterations. Identify specific visual patterns that "
+                "distinguish effective from ineffective ads.\n\n"
+                "VISUAL EXAMPLES - BEST VS WORST PERFORMING:"
             ),
         }
     ]
@@ -414,9 +487,26 @@ def _score_prompt_with_logprobs(
     creative_brief: dict[str, Any],
     *,
     seed: int | None = None,
+    persona: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Text-only pre-score for prompt selection."""
-    judge_prompt = f"""You are rating an image-generation prompt for a single advertising campaign.
+    if persona:
+        judge_prompt = f"""PERSONA DATA:
+{_persona_sample_text(persona)}
+
+TASK:
+Return only one item from ["1","2","3","4","5"] for ad effectiveness.
+
+Effective Score Scale Definition:
+1: Extremely Unlikely. The persona would actively ignore or be annoyed by this ad.
+2: Unlikely. The persona would likely scroll past without a second thought.
+3: Mediocre. It is hard to decide whether the persona would click or not click.
+4: Likely. The persona is intrigued and has a good chance of clicking to learn more.
+5: Extremely Likely. The persona is the ideal target; a click is almost certain.
+
+No explanation. Just the score."""
+    else:
+        judge_prompt = f"""You are rating an image-generation prompt for a single advertising campaign.
 
 Campaign context:
 {_campaign_context_text(session_data, sidebar_settings, creative_brief)}
@@ -455,7 +545,7 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _extract_digit_probs_from_completion(response)
-        mode = "prompt-logprobs"
+        mode = "prompt-persona-logprobs" if persona else "prompt-logprobs"
     except Exception:
         response = client.chat.completions.create(
             model=EVAL_MODEL,
@@ -468,11 +558,12 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
-        mode = "prompt-plain"
+        mode = "prompt-persona-plain" if persona else "prompt-plain"
     return {
         "score": _score_from_probs(probs),
         "probs": probs,
         "mode": mode,
+        "persona_id": persona.get("persona_id") if persona else None,
     }
 
 
@@ -485,9 +576,26 @@ def _score_image_with_logprobs(
     creative_brief: dict[str, Any],
     *,
     seed: int | None = None,
+    persona: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Multimodal score for a rendered advertisement."""
-    judge_text = f"""Evaluate this advertisement candidate for the following campaign.
+    if persona:
+        judge_text = f"""PERSONA DATA:
+{_persona_sample_text(persona)}
+
+TASK:
+Return only one item from ["1","2","3","4","5"] for ad effectiveness.
+
+Effective Score Scale Definition:
+1: Extremely Unlikely. The persona would actively ignore or be annoyed by this ad.
+2: Unlikely. The persona would likely scroll past without a second thought.
+3: Mediocre. It is hard to decide whether the persona would click or not click.
+4: Likely. The persona is intrigued and has a good chance of clicking to learn more.
+5: Extremely Likely. The persona is the ideal target; a click is almost certain.
+
+No explanation. Just the score."""
+    else:
+        judge_text = f"""Evaluate this advertisement candidate for the following campaign.
 
 Campaign context:
 {_campaign_context_text(session_data, sidebar_settings, creative_brief)}
@@ -534,8 +642,16 @@ Do not explain your answer."""
             seed=seed,
         )
         probs = _extract_digit_probs_from_completion(response)
-        mode = "image-logprobs"
+        mode = "image-persona-logprobs" if persona else "image-logprobs"
     except Exception:
+        if persona:
+            probs = {str(i): 0.2 for i in range(1, 6)}
+            return {
+                "score": _score_from_probs(probs),
+                "probs": probs,
+                "mode": "image-persona-uniform-fallback",
+                "persona_id": persona.get("persona_id"),
+            }
         try:
             response = client.chat.completions.create(
                 model=EVAL_MODEL,
@@ -554,7 +670,7 @@ Do not explain your answer."""
                 seed=seed,
             )
             probs = _one_hot_probs(_parse_score_digit(response.choices[0].message.content or ""))
-            mode = "image-plain"
+            mode = "image-persona-plain" if persona else "image-plain"
         except Exception:
             fallback = _score_prompt_with_logprobs(
                 client,
@@ -563,6 +679,7 @@ Do not explain your answer."""
                 sidebar_settings,
                 creative_brief,
                 seed=seed,
+                persona=persona,
             )
             probs = fallback["probs"]
             mode = f"prompt-fallback:{fallback.get('mode', 'unknown')}"
@@ -570,6 +687,7 @@ Do not explain your answer."""
         "score": _score_from_probs(probs),
         "probs": probs,
         "mode": mode,
+        "persona_id": persona.get("persona_id") if persona else None,
     }
 
 
@@ -579,8 +697,9 @@ def _aggregate_soft_scores(
     repeats: int,
     seed_base: int | None = None,
 ) -> dict[str, Any]:
-    """Average probability distributions from repeated scoring calls."""
+    """Average judge distributions but use a pessimistic score across repeats."""
     all_probs: list[dict[str, float]] = []
+    repeat_scores: list[float] = []
     mode = None
     for idx in range(max(1, repeats)):
         try:
@@ -588,16 +707,105 @@ def _aggregate_soft_scores(
         except Exception:
             result = {"probs": _failure_probs(), "mode": "fallback"}
         all_probs.append(result["probs"])
+        repeat_scores.append(_score_from_probs(result["probs"]))
         mode = result.get("mode")
 
     averaged = {
         key: sum(prob[key] for prob in all_probs) / len(all_probs)
         for key in all_probs[0].keys()
     }
+    mean_score = _score_from_probs(averaged)
+    if len(repeat_scores) > 1:
+        variance = sum((score - mean_score) ** 2 for score in repeat_scores) / len(repeat_scores)
+        conservative_score = max(1.0, mean_score - math.sqrt(variance))
+        aggregation_mode = "mean-minus-std"
+    else:
+        conservative_score = mean_score
+        aggregation_mode = "single"
+
     return {
-        "score": _score_from_probs(averaged),
+        "score": conservative_score,
         "probs": averaged,
-        "mode": mode,
+        "mode": f"{mode or 'unknown'}:{aggregation_mode}",
+        "mean_score": mean_score,
+        "repeat_scores": repeat_scores,
+        "score_aggregation": aggregation_mode,
+    }
+
+
+def _aggregate_persona_scores(
+    scorer,
+    *,
+    seed_base: int | None = None,
+    fallback_scorer=None,
+    fallback_repeats: int = 1,
+) -> dict[str, Any]:
+    """Aggregate exactly the local persona score distributions."""
+    available_personas = _load_personas()[:MAX_PERSONA_FILES]
+    if available_personas and DEFAULT_PERSONA_COUNT < len(available_personas):
+        rng = random.Random((seed_base or 0) + 1000)
+        personas = rng.sample(available_personas, DEFAULT_PERSONA_COUNT)
+    else:
+        personas = available_personas
+    if not personas:
+        if fallback_scorer is None:
+            return {
+                "score": 1.0,
+                "probs": _failure_probs(),
+                "mode": "persona-missing",
+                "mean_score": 1.0,
+                "repeat_scores": [1.0],
+                "score_aggregation": "persona-missing",
+                "persona_scores": {},
+                "persona_count": 0,
+            }
+        fallback = _aggregate_soft_scores(
+            fallback_scorer,
+            repeats=fallback_repeats,
+            seed_base=seed_base,
+        )
+        fallback["mode"] = f"{fallback.get('mode', 'unknown')}:no-persona-fallback"
+        fallback["persona_scores"] = {}
+        fallback["persona_count"] = 0
+        return fallback
+
+    all_probs: list[dict[str, float]] = []
+    persona_scores: dict[str, float] = {}
+    mode = None
+    for idx, persona in enumerate(personas):
+        seed = None if seed_base is None else seed_base + idx
+        persona_id = persona.get("persona_id", str(idx + 1))
+        try:
+            result = scorer(persona, seed)
+        except Exception:
+            result = {
+                "probs": _failure_probs(),
+                "mode": "persona-fallback",
+                "persona_id": persona_id,
+            }
+
+        probs = result.get("probs") or _failure_probs()
+        all_probs.append(probs)
+        persona_scores[persona_id] = _score_from_probs(probs)
+        mode = result.get("mode") or mode
+
+    averaged = {
+        key: sum(prob[key] for prob in all_probs) / len(all_probs)
+        for key in all_probs[0].keys()
+    }
+    mean_score = _score_from_probs(averaged)
+    individual_scores = list(persona_scores.values())
+    aggregation_mode = f"persona-mean:n={len(personas)}"
+
+    return {
+        "score": mean_score,
+        "probs": averaged,
+        "mode": f"{mode or 'unknown'}:{aggregation_mode}",
+        "mean_score": mean_score,
+        "repeat_scores": individual_scores,
+        "score_aggregation": aggregation_mode,
+        "persona_scores": persona_scores,
+        "persona_count": len(personas),
     }
 
 
@@ -705,23 +913,25 @@ def _generate_shared_reflection(
         return "No strong shared pattern yet."
 
     def _text_only_reflection() -> str:
-        system_prompt = "You analyze prompt-performance patterns. Return JSON only."
-        user_prompt = f"""Review the prompt history below and infer what tends to help or hurt performance.
+        system_prompt = "You analyze ad-performance patterns from prompt history."
+        user_prompt = f"""You are an expert at analyzing visual patterns in advertising performance.
+
+Review the prompt history below as a fallback when rendered images are unavailable. Infer visual patterns that distinguish lower-scoring from higher-scoring ad iterations.
 
 {_history_summary(shared_history, top_n=4, bottom_n=4)}
 
-Return JSON with one key: "reflection".
-The reflection should be one short paragraph focused on actionable prompt-level patterns.
+RESPONSE FORMAT:
+Provide a structured analysis of visual patterns observed, focusing on what distinguishes high-performing from low-performing ads.
+Cover composition, lighting, color palette, subject positioning, brand integration, and environmental elements. Focus on concrete changes future prompts should make.
 """
 
-        payload = _request_json_object(
+        reflection = _request_text(
             client,
             system_prompt,
             user_prompt,
             temperature=1.0,
             max_completion_tokens=2048,
         )
-        reflection = str(payload.get("reflection", "")).strip()
         return reflection or "No strong shared pattern yet."
 
     multimodal_content = _build_multimodal_reflection_content(
@@ -732,9 +942,28 @@ The reflection should be one short paragraph focused on actionable prompt-level 
     if not multimodal_content:
         return _text_only_reflection()
 
-    system_prompt = "You analyze ad-performance patterns from prompt/image history. Return JSON only."
+    multimodal_content.append(
+        {
+            "type": "text",
+            "text": (
+                "Based on your visual analysis, identify patterns that correlate with higher "
+                "effectiveness scores:\n"
+                "1. Visual composition and framing differences\n"
+                "2. Lighting conditions and mood variations\n"
+                "3. Color palettes and visual tone patterns\n"
+                "4. Subject positioning and action effectiveness\n"
+                "5. Brand integration approaches\n"
+                "6. Environmental and atmospheric elements\n\n"
+                "RESPONSE FORMAT:\n"
+                "Provide a structured analysis of visual patterns observed, focusing on "
+                "what distinguishes high-performing from low-performing ads."
+            ),
+        }
+    )
+
+    system_prompt = "You analyze ad-performance patterns from prompt/image history."
     try:
-        payload = _request_json_object(
+        reflection = _request_text(
             client,
             system_prompt,
             multimodal_content,
@@ -744,8 +973,115 @@ The reflection should be one short paragraph focused on actionable prompt-level 
     except Exception:
         return _text_only_reflection()
 
-    reflection = str(payload.get("reflection", "")).strip()
     return reflection or _text_only_reflection()
+
+
+def _generate_textual_gradient(
+    client,
+    current_prompt: str,
+    shared_history: list[dict[str, Any]],
+    shared_reflection: str | None,
+) -> str:
+    """Generate reference-style textual improvement suggestions."""
+    if shared_reflection:
+        user_prompt = f"""You are an expert at optimizing image generation prompts for advertising effectiveness.
+
+CURRENT PROMPT TO IMPROVE:
+{current_prompt}
+
+PERFORMANCE ANALYSIS FROM PREVIOUS ITERATIONS:
+{shared_reflection}
+
+TASK:
+Based on the performance analysis above, generate specific, actionable improvements to make the current prompt more effective.
+
+Focus on implementing the successful visual patterns identified in the analysis while avoiding the ineffective elements.
+
+Provide 3-5 specific, implementable suggestions for improvement. It can be addition of a new prompt part, deletion of an existing prompt part, or rewriting a prompt part.
+Each suggestion should reference insights from the performance analysis.
+
+RESPONSE FORMAT:
+1. [Specific improvement suggestion based on performance analysis]
+2. [Specific improvement suggestion based on performance analysis]
+3. [Specific improvement suggestion based on performance analysis]
+
+Be concrete and actionable. Focus on changes that will meaningfully improve ad effectiveness based on the analysis."""
+    else:
+        user_prompt = f"""You are an expert at optimizing image generation prompts for advertising effectiveness.
+
+CURRENT PROMPT TO IMPROVE:
+{current_prompt}
+
+TASK:
+Generate specific, actionable improvements to make this ad prompt more effective.
+Focus on elements that will increase engagement and appeal to the target audience.
+
+Consider improvements in:
+1. Visual composition and framing
+2. Emotional appeal and messaging
+3. Color palette and lighting
+4. Subject positioning and action
+5. Brand integration and logo placement
+6. Text overlay space and readability
+
+Provide 3-5 specific, implementable suggestions for improvement.
+Each suggestion should be concrete and actionable.
+
+RESPONSE FORMAT:
+1. [Specific improvement suggestion]
+2. [Specific improvement suggestion]
+3. [Specific improvement suggestion]
+
+Be concise but specific. Focus on changes that will meaningfully improve ad effectiveness."""
+
+    try:
+        return _request_text(
+            client,
+            "You generate textual gradients for advertising prompt optimization.",
+            user_prompt,
+            temperature=0.8,
+            max_completion_tokens=2048,
+        )
+    except Exception:
+        return "Improve visual appeal and emotional connection with the target audience."
+
+
+def _apply_textual_gradient(
+    client,
+    current_prompt: str,
+    gradient: str,
+) -> str:
+    """Apply textual improvement suggestions to produce one revised prompt."""
+    user_prompt = f"""You are an expert at revising image generation prompts based on improvement suggestions.
+
+ORIGINAL PROMPT:
+{current_prompt}
+
+IMPROVEMENT SUGGESTIONS:
+{gradient}
+
+TASK:
+Rewrite the prompt incorporating the improvement suggestions while maintaining the core message and structure.
+
+REQUIREMENTS:
+- Keep the prompt structure and format similar to the original.
+- Integrate the improvement suggestions naturally.
+- Maintain coherence and readability.
+- Ensure the prompt is optimized for image generation.
+- Keep the prompt length reasonable and under 220 words.
+
+Return ONLY the revised prompt, no explanations or additional text."""
+    try:
+        revised = _request_text(
+            client,
+            "You apply textual gradients to image-generation prompts.",
+            user_prompt,
+            temperature=0.1,
+            max_completion_tokens=2048,
+        )
+        return _normalize_prompt(revised) or current_prompt
+    except Exception:
+        return current_prompt
 
 
 def _generate_efficient_candidates(
@@ -756,49 +1092,23 @@ def _generate_efficient_candidates(
     sidebar_settings: dict[str, Any],
     creative_brief: dict[str, Any],
     shared_history: list[dict[str, Any]],
-    shared_reflection: str,
+    shared_reflection: str | None,
     *,
     candidate_count: int,
 ) -> dict[str, Any]:
-    """Generate multiple prompt candidates for the efficient optimizer."""
-    system_prompt = (
-        "You propose multiple high-upside prompt revisions for ad creative generation. "
-        "Return JSON only."
-    )
-    user_prompt = f"""Create {candidate_count} revised prompt candidates for the current trajectory.
-
-Campaign context:
-{_campaign_context_text(session_data, sidebar_settings, creative_brief)}
-
-Current score: {current_score:.3f}
-Current prompt:
-{current_prompt}
-
-Shared reflection:
-{shared_reflection}
-
-Shared history summary:
-{_history_summary(shared_history, top_n=3, bottom_n=3)}
-
-Requirements:
-- Each candidate must stay faithful to the same campaign.
-- Candidates should be meaningfully distinct from one another.
-- Use the shared reflection to avoid weak patterns and explore stronger ones.
-- Keep each prompt coherent and under 220 words.
-- Return JSON with keys "strategy" and "prompts".
-"""
-
-    payload = _request_json_object(
-        client,
-        system_prompt,
-        user_prompt,
-        temperature=1.0,
-        max_completion_tokens=4096,
-    )
-
+    """Generate multiple gradient-applied prompt candidates for TextBO."""
     prompts: list[str] = []
-    if isinstance(payload.get("prompts"), list):
-        prompts = [str(item) for item in payload["prompts"] if isinstance(item, str)]
+    gradients: list[str] = []
+    for _ in range(candidate_count):
+        gradient = _generate_textual_gradient(
+            client,
+            current_prompt,
+            shared_history,
+            shared_reflection,
+        )
+        gradients.append(gradient)
+        prompts.append(_apply_textual_gradient(client, current_prompt, gradient))
+
     prompts = _dedupe_prompts(prompts)
     if not prompts:
         prompts = [current_prompt]
@@ -807,7 +1117,7 @@ Requirements:
         prompts.append(prompts[-1])
 
     return {
-        "strategy": str(payload.get("strategy", "")).strip(),
+        "strategy": "\n\n".join(gradients[:3]),
         "prompts": prompts[:candidate_count],
     }
 
@@ -845,6 +1155,284 @@ def _generate_image_for_prompt(
     return (str(output_path), error) if output_path else (None, error)
 
 
+def _render_textbo_tournament_candidate(
+    *,
+    candidate_prompt: str,
+    candidate_idx: int,
+    openai_client,
+    gemini_key: str,
+    model_key: str,
+    aspect_ratio: str,
+    gpt_image_quality: str,
+    style_image_bytes: bytes | None,
+) -> dict[str, Any]:
+    """Render one Best-of-N tournament candidate."""
+    output_path, error = _generate_image_for_prompt(
+        client=openai_client,
+        gemini_key=gemini_key,
+        model_key=model_key,
+        prompt=candidate_prompt,
+        aspect_ratio=aspect_ratio,
+        gpt_image_quality=gpt_image_quality,
+        style_image_bytes=style_image_bytes,
+    )
+    return {
+        "candidate_idx": candidate_idx,
+        "prompt": candidate_prompt,
+        "output_path": output_path,
+        "error": error,
+        "selected": False,
+    }
+
+
+def _parse_binary_choice(text: str) -> int | None:
+    """Parse an exact 1/2 tournament choice."""
+    stripped = (text or "").strip()
+    return int(stripped) if stripped in {"1", "2"} else None
+
+
+def _pairwise_compare_tournament_candidates(
+    *,
+    client,
+    candidate1: dict[str, Any],
+    candidate2: dict[str, Any],
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    rng: random.Random,
+    comparisons: int = TOURNAMENT_COMPARISONS,
+) -> tuple[int, str]:
+    """Compare two rendered candidates; returns 0 when candidate1 wins, 1 otherwise."""
+    path1 = candidate1.get("output_path")
+    path2 = candidate2.get("output_path")
+    if not path1 or not os.path.exists(path1):
+        return 1, "candidate1-missing-image"
+    if not path2 or not os.path.exists(path2):
+        return 0, "candidate2-missing-image"
+
+    comparison_prompt = """You are evaluating two mobile advertisement images for effectiveness.
+
+CRITICAL: Return exactly 1 or 2 with no other text.
+- Return 1 if the first image is more effective as an ad.
+- Return 2 if the second image is more effective as an ad."""
+
+    votes_candidate1 = 0
+    votes_candidate2 = 0
+    fallback_votes = 0
+    for _ in range(max(1, comparisons)):
+        try:
+            response = client.chat.completions.create(
+                model=EVAL_MODEL,
+                messages=[
+                    {"role": "system", "content": "Return exactly one token: 1 or 2."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": comparison_prompt},
+                            {"type": "text", "text": "IMAGE 1:"},
+                            {"type": "image_url", "image_url": {"url": _path_to_data_url(path1)}},
+                            {"type": "text", "text": "IMAGE 2:"},
+                            {"type": "image_url", "image_url": {"url": _path_to_data_url(path2)}},
+                        ],
+                    },
+                ],
+                temperature=0,
+                max_completion_tokens=1,
+            )
+            choice = _parse_binary_choice(response.choices[0].message.content or "")
+            if choice == 1:
+                votes_candidate1 += 1
+                continue
+            if choice == 2:
+                votes_candidate2 += 1
+                continue
+        except Exception:
+            pass
+
+        fallback_votes += 1
+        if rng.randint(0, 1) == 0:
+            votes_candidate1 += 1
+        else:
+            votes_candidate2 += 1
+
+    winner_idx = 0 if votes_candidate1 > votes_candidate2 else 1
+    mode = f"pairwise-majority:k={max(1, comparisons)}"
+    if fallback_votes:
+        mode += f":fallback_votes={fallback_votes}"
+    return winner_idx, mode
+
+
+def _tournament_select_candidate(
+    *,
+    client,
+    candidates: list[dict[str, Any]],
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    tournament_seed: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Select a Best-of-N winner using the reference-style knockout tournament."""
+    if not candidates:
+        raise ValueError("Tournament requires at least one candidate.")
+
+    valid_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("output_path") and os.path.exists(candidate["output_path"])
+    ]
+    if not valid_candidates:
+        return candidates[0], []
+    if len(valid_candidates) == 1:
+        return valid_candidates[0], []
+
+    rng = random.Random(tournament_seed)
+    current_round = [dict(candidate) for candidate in valid_candidates]
+    rng.shuffle(current_round)
+    tournament_log: list[dict[str, Any]] = []
+    round_num = 1
+
+    while len(current_round) > 1:
+        next_round: list[dict[str, Any]] = []
+        for match_idx in range(0, len(current_round) - 1, 2):
+            candidate1 = current_round[match_idx]
+            candidate2 = current_round[match_idx + 1]
+            winner_idx, mode = _pairwise_compare_tournament_candidates(
+                client=client,
+                candidate1=candidate1,
+                candidate2=candidate2,
+                session_data=session_data,
+                sidebar_settings=sidebar_settings,
+                creative_brief=creative_brief,
+                rng=rng,
+            )
+            winner = candidate1 if winner_idx == 0 else candidate2
+            next_round.append(winner)
+            tournament_log.append(
+                {
+                    "round": round_num,
+                    "match": match_idx // 2 + 1,
+                    "candidate_1_idx": candidate1.get("candidate_idx"),
+                    "candidate_2_idx": candidate2.get("candidate_idx"),
+                    "winner_idx": winner.get("candidate_idx"),
+                    "mode": mode,
+                }
+            )
+
+        if len(current_round) % 2 == 1:
+            bye_candidate = current_round[-1]
+            next_round.append(bye_candidate)
+            tournament_log.append(
+                {
+                    "round": round_num,
+                    "match": len(current_round) // 2 + 1,
+                    "candidate_1_idx": bye_candidate.get("candidate_idx"),
+                    "candidate_2_idx": None,
+                    "winner_idx": bye_candidate.get("candidate_idx"),
+                    "mode": "bye",
+                }
+            )
+
+        current_round = next_round
+        round_num += 1
+
+    return current_round[0], tournament_log
+
+
+def _run_textbo_gradient_tournament(
+    *,
+    openai_client,
+    gemini_key: str,
+    model_key: str,
+    aspect_ratio: str,
+    gpt_image_quality: str,
+    style_image_bytes: bytes | None,
+    session_data: dict[str, Any],
+    sidebar_settings: dict[str, Any],
+    creative_brief: dict[str, Any],
+    trajectory: dict[str, Any],
+    step: int,
+    gradient_step: int,
+    efficient_candidates: int,
+    shared_history_snapshot: list[dict[str, Any]],
+    shared_reflection: str | None,
+) -> dict[str, Any]:
+    """Run one TextBO gradient step: generate N prompts, render, then tournament-select."""
+    current = trajectory["current"]
+    proposals = _generate_efficient_candidates(
+        openai_client,
+        current["prompt"],
+        current["score"],
+        session_data,
+        sidebar_settings,
+        creative_brief,
+        shared_history_snapshot,
+        shared_reflection,
+        candidate_count=efficient_candidates,
+    )
+
+    rendered_candidates: list[dict[str, Any]] = []
+    render_parallelism = min(
+        DEFAULT_EFFICIENT_PRESCORE_PARALLELISM,
+        max(1, len(proposals["prompts"])),
+    )
+    with ThreadPoolExecutor(max_workers=render_parallelism) as executor:
+        future_to_idx = {
+            executor.submit(
+                _render_textbo_tournament_candidate,
+                candidate_idx=cand_idx,
+                candidate_prompt=candidate_prompt,
+                openai_client=openai_client,
+                gemini_key=gemini_key,
+                model_key=model_key,
+                aspect_ratio=aspect_ratio,
+                gpt_image_quality=gpt_image_quality,
+                style_image_bytes=style_image_bytes,
+            ): cand_idx
+            for cand_idx, candidate_prompt in enumerate(proposals["prompts"], start=1)
+        }
+
+        for future in as_completed(future_to_idx):
+            cand_idx = future_to_idx[future]
+            try:
+                candidate = future.result()
+            except Exception as exc:
+                candidate = {
+                    "candidate_idx": cand_idx,
+                    "prompt": proposals["prompts"][cand_idx - 1],
+                    "output_path": None,
+                    "error": f"Tournament candidate failed: {exc}",
+                    "selected": False,
+                }
+            candidate["gradient_step"] = gradient_step
+            rendered_candidates.append(candidate)
+
+    rendered_candidates.sort(key=lambda item: item["candidate_idx"])
+    tournament_seed = step * 30000 + trajectory["trajectory_id"] * 100 + gradient_step * 10
+    selected_candidate, tournament_log = _tournament_select_candidate(
+        client=openai_client,
+        candidates=rendered_candidates,
+        session_data=session_data,
+        sidebar_settings=sidebar_settings,
+        creative_brief=creative_brief,
+        tournament_seed=tournament_seed,
+    )
+    selected_idx = selected_candidate.get("candidate_idx")
+    for candidate in rendered_candidates:
+        candidate["selected"] = candidate.get("candidate_idx") == selected_idx
+
+    for match in tournament_log:
+        match["gradient_step"] = gradient_step
+
+    return {
+        "gradient_step": gradient_step,
+        "selected_candidate": selected_candidate,
+        "rendered_candidates": rendered_candidates,
+        "tournament_log": tournament_log,
+        "tournament_seed": tournament_seed,
+        "strategy": proposals.get("strategy"),
+    }
+
+
 def _build_candidate_record(
     *,
     candidate_id: str,
@@ -856,6 +1444,8 @@ def _build_candidate_record(
     error: str | None = None,
     prompt_prescore: float | None = None,
     prompt_prescore_probs: dict[str, float] | None = None,
+    score_details: dict[str, Any] | None = None,
+    prompt_prescore_details: dict[str, Any] | None = None,
     score_mode: str | None = None,
     prompt_prescore_mode: str | None = None,
     strategy: str | None = None,
@@ -878,6 +1468,8 @@ def _build_candidate_record(
         "error": error,
         "prompt_prescore": prompt_prescore,
         "prompt_prescore_probs": prompt_prescore_probs,
+        "score_details": score_details,
+        "prompt_prescore_details": prompt_prescore_details,
         "score_mode": score_mode,
         "prompt_prescore_mode": prompt_prescore_mode,
         "strategy": strategy,
@@ -919,8 +1511,19 @@ def _evaluate_initial_candidate(
     )
 
     if output_path:
-        scored = _aggregate_soft_scores(
-            lambda seed_value: _score_image_with_logprobs(
+        scored = _aggregate_persona_scores(
+            lambda persona, seed_value: _score_image_with_logprobs(
+                openai_client,
+                output_path,
+                prompt,
+                session_data,
+                sidebar_settings,
+                creative_brief,
+                seed=seed_value,
+                persona=persona,
+            ),
+            seed_base=candidate_idx * 100,
+            fallback_scorer=lambda seed_value: _score_image_with_logprobs(
                 openai_client,
                 output_path,
                 prompt,
@@ -929,16 +1532,22 @@ def _evaluate_initial_candidate(
                 creative_brief,
                 seed=seed_value,
             ),
-            repeats=judge_repeats,
-            seed_base=candidate_idx * 100,
+            fallback_repeats=judge_repeats,
         )
         score = scored["score"]
         probs = scored["probs"]
         score_mode = scored.get("mode")
+        score_details = {
+            "mean_score": scored.get("mean_score"),
+            "persona_scores": scored.get("persona_scores"),
+            "persona_count": scored.get("persona_count"),
+            "score_aggregation": scored.get("score_aggregation"),
+        }
     else:
         score = 1.0
         probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
         score_mode = "image-generation-failed"
+        score_details = None
 
     return {
         "candidate_idx": candidate_idx,
@@ -951,6 +1560,7 @@ def _evaluate_initial_candidate(
             probs=probs,
             source="initial",
             error=error,
+            score_details=score_details,
             score_mode=score_mode,
         ),
     }
@@ -969,8 +1579,18 @@ def _prescore_efficient_candidate(
     judge_repeats: int,
 ) -> dict[str, Any]:
     """Pre-score one efficient-search prompt candidate."""
-    prompt_scored = _aggregate_soft_scores(
-        lambda seed_value: _score_prompt_with_logprobs(
+    prompt_scored = _aggregate_persona_scores(
+        lambda persona, seed_value: _score_prompt_with_logprobs(
+            openai_client,
+            candidate_prompt,
+            session_data,
+            sidebar_settings,
+            creative_brief,
+            seed=seed_value,
+            persona=persona,
+        ),
+        seed_base=step * 10000 + trajectory_id * 100 + candidate_idx,
+        fallback_scorer=lambda seed_value: _score_prompt_with_logprobs(
             openai_client,
             candidate_prompt,
             session_data,
@@ -978,14 +1598,19 @@ def _prescore_efficient_candidate(
             creative_brief,
             seed=seed_value,
         ),
-        repeats=judge_repeats,
-        seed_base=step * 10000 + trajectory_id * 100 + candidate_idx,
+        fallback_repeats=judge_repeats,
     )
     return {
         "prompt": candidate_prompt,
         "score": prompt_scored["score"],
         "probs": prompt_scored["probs"],
         "mode": prompt_scored.get("mode"),
+        "details": {
+            "mean_score": prompt_scored.get("mean_score"),
+            "persona_scores": prompt_scored.get("persona_scores"),
+            "persona_count": prompt_scored.get("persona_count"),
+            "score_aggregation": prompt_scored.get("score_aggregation"),
+        },
     }
 
 
@@ -1003,76 +1628,82 @@ def _run_efficient_trajectory_step(
     trajectory: dict[str, Any],
     step: int,
     efficient_candidates: int,
+    gradient_steps: int,
     judge_repeats: int,
     shared_history_snapshot: list[dict[str, Any]],
-    shared_reflection: str,
+    shared_reflection: str | None,
+    source: str = "efficient",
+    candidate_id_prefix: str = "efficient",
 ) -> dict[str, Any]:
     """Run one efficient-search trajectory step against a shared snapshot."""
     current = trajectory["current"]
-    proposals = _generate_efficient_candidates(
-        openai_client,
-        current["prompt"],
-        current["score"],
-        session_data,
-        sidebar_settings,
-        creative_brief,
-        shared_history_snapshot,
-        shared_reflection,
-        candidate_count=efficient_candidates,
+    selected_candidate: dict[str, Any] = {
+        "candidate_idx": 0,
+        "gradient_step": 0,
+        "prompt": current["prompt"],
+        "output_path": current.get("output_path"),
+        "error": current.get("error"),
+        "selected": True,
+    }
+    rendered_candidates: list[dict[str, Any]] = []
+    tournament_log: list[dict[str, Any]] = []
+    tournament_seeds: list[int] = []
+    strategies: list[str] = []
+
+    for gradient_step in range(1, max(1, gradient_steps) + 1):
+        gradient_result = _run_textbo_gradient_tournament(
+            openai_client=openai_client,
+            gemini_key=gemini_key,
+            model_key=model_key,
+            aspect_ratio=aspect_ratio,
+            gpt_image_quality=gpt_image_quality,
+            style_image_bytes=style_image_bytes,
+            session_data=session_data,
+            sidebar_settings=sidebar_settings,
+            creative_brief=creative_brief,
+            trajectory=trajectory,
+            step=step,
+            gradient_step=gradient_step,
+            efficient_candidates=efficient_candidates,
+            shared_history_snapshot=shared_history_snapshot,
+            shared_reflection=shared_reflection,
+        )
+        rendered_candidates.extend(gradient_result["rendered_candidates"])
+        tournament_log.extend(gradient_result["tournament_log"])
+        tournament_seeds.append(gradient_result["tournament_seed"])
+        if gradient_result.get("strategy"):
+            strategies.append(str(gradient_result["strategy"]))
+        candidate = gradient_result["selected_candidate"]
+        if candidate.get("output_path") and os.path.exists(candidate["output_path"]):
+            selected_candidate = candidate
+
+    final_selected_id = (
+        selected_candidate.get("gradient_step"),
+        selected_candidate.get("candidate_idx"),
     )
+    for candidate in rendered_candidates:
+        candidate["selected"] = (
+            candidate.get("gradient_step"),
+            candidate.get("candidate_idx"),
+        ) == final_selected_id
 
-    prescored_candidates: list[dict[str, Any]] = []
-    prescore_parallelism = min(
-        DEFAULT_EFFICIENT_PRESCORE_PARALLELISM,
-        max(1, len(proposals["prompts"])),
-    )
-    with ThreadPoolExecutor(max_workers=prescore_parallelism) as executor:
-        future_to_idx = {
-            executor.submit(
-                _prescore_efficient_candidate,
-                candidate_prompt=candidate_prompt,
-                candidate_idx=cand_idx,
-                trajectory_id=trajectory["trajectory_id"],
-                step=step,
-                openai_client=openai_client,
-                session_data=session_data,
-                sidebar_settings=sidebar_settings,
-                creative_brief=creative_brief,
-                judge_repeats=judge_repeats,
-            ): cand_idx
-            for cand_idx, candidate_prompt in enumerate(proposals["prompts"], start=1)
-        }
-
-        completed_prescores: list[dict[str, Any]] = []
-        for future in as_completed(future_to_idx):
-            cand_idx = future_to_idx[future]
-            result = future.result()
-            completed_prescores.append(
-                {
-                    "candidate_idx": cand_idx,
-                    "candidate": result,
-                }
-            )
-
-    completed_prescores.sort(key=lambda item: item["candidate_idx"])
-    prescored_candidates = [item["candidate"] for item in completed_prescores]
-
-    selected_prompt_entry = max(prescored_candidates, key=lambda item: item["score"])
-    selected_prompt = selected_prompt_entry["prompt"]
-
-    output_path, error = _generate_image_for_prompt(
-        client=openai_client,
-        gemini_key=gemini_key,
-        model_key=model_key,
-        prompt=selected_prompt,
-        aspect_ratio=aspect_ratio,
-        gpt_image_quality=gpt_image_quality,
-        style_image_bytes=style_image_bytes,
-    )
-
+    selected_prompt = selected_candidate["prompt"]
+    output_path = selected_candidate.get("output_path")
+    error = selected_candidate.get("error")
     if output_path:
-        image_scored = _aggregate_soft_scores(
-            lambda seed_value: _score_image_with_logprobs(
+        image_scored = _aggregate_persona_scores(
+            lambda persona, seed_value: _score_image_with_logprobs(
+                openai_client,
+                output_path,
+                selected_prompt,
+                session_data,
+                sidebar_settings,
+                creative_brief,
+                seed=seed_value,
+                persona=persona,
+            ),
+            seed_base=step * 20000 + trajectory["trajectory_id"] * 100,
+            fallback_scorer=lambda seed_value: _score_image_with_logprobs(
                 openai_client,
                 output_path,
                 selected_prompt,
@@ -1081,39 +1712,53 @@ def _run_efficient_trajectory_step(
                 creative_brief,
                 seed=seed_value,
             ),
-            repeats=judge_repeats,
-            seed_base=step * 20000 + trajectory["trajectory_id"] * 100,
+            fallback_repeats=judge_repeats,
         )
         final_score = image_scored["score"]
         final_probs = image_scored["probs"]
         final_score_mode = image_scored.get("mode")
+        final_score_details = {
+            "mean_score": image_scored.get("mean_score"),
+            "persona_scores": image_scored.get("persona_scores"),
+            "persona_count": image_scored.get("persona_count"),
+            "score_aggregation": image_scored.get("score_aggregation"),
+        }
     else:
-        final_score = 1.0
-        final_probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
+        final_score = 3.0
+        final_probs = {str(i): (1.0 if i == 3 else 0.0) for i in range(1, 6)}
         final_score_mode = "image-generation-failed"
+        final_score_details = None
 
     accepted = final_score > current["score"]
     step_entry = _build_candidate_record(
-        candidate_id=f"efficient_traj{trajectory['trajectory_id']:02d}_step{step:02d}",
+        candidate_id=f"{candidate_id_prefix}_traj{trajectory['trajectory_id']:02d}_step{step:02d}",
         prompt=selected_prompt,
         output_path=output_path,
         score=final_score,
         probs=final_probs,
-        source="efficient",
+        source=source,
         error=error,
-        prompt_prescore=selected_prompt_entry["score"],
-        prompt_prescore_probs=selected_prompt_entry["probs"],
+        prompt_prescore=None,
+        prompt_prescore_probs=None,
+        score_details=final_score_details,
+        prompt_prescore_details=None,
         score_mode=final_score_mode,
-        prompt_prescore_mode=selected_prompt_entry.get("mode"),
-        strategy=proposals.get("strategy"),
+        prompt_prescore_mode="image-tournament",
+        strategy="\n\n".join(strategies[:3]),
         accepted=accepted,
         start_seed_id=trajectory["seed"]["candidate_id"],
         start_seed_rank=trajectory["seed"].get("worst_rank"),
         step=step,
         trajectory_id=trajectory["trajectory_id"],
     )
-    step_entry["candidate_prompts"] = prescored_candidates
+    step_entry["candidate_prompts"] = rendered_candidates
     step_entry["shared_reflection"] = shared_reflection
+    step_entry["selection_mode"] = f"image-tournament:G={max(1, gradient_steps)}:N={efficient_candidates}"
+    step_entry["tournament_log"] = tournament_log
+    step_entry["tournament_seed"] = tournament_seeds[-1] if tournament_seeds else None
+    step_entry["tournament_seeds"] = tournament_seeds
+    step_entry["tournament_candidate_count"] = len(rendered_candidates)
+    step_entry["gradient_steps"] = max(1, gradient_steps)
 
     return {
         "trajectory_id": trajectory["trajectory_id"],
@@ -1125,6 +1770,15 @@ def _run_efficient_trajectory_step(
 def _rank_candidates_desc(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort candidates by score descending."""
     return sorted(candidates, key=lambda item: item.get("score", 0.0), reverse=True)
+
+
+def _shared_history_boundary_seeds(seeds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Initialize shared reflection history with worst and kth-worst boundary seeds."""
+    if not seeds:
+        return []
+    if len(seeds) == 1:
+        return [dict(seeds[0])]
+    return [dict(seeds[0]), dict(seeds[-1])]
 
 
 def _run_base_optimizer_chain(
@@ -1171,8 +1825,19 @@ def _run_base_optimizer_chain(
         )
 
         if output_path:
-            scored = _aggregate_soft_scores(
-                lambda seed_value: _score_image_with_logprobs(
+            scored = _aggregate_persona_scores(
+                lambda persona, seed_value: _score_image_with_logprobs(
+                    openai_client,
+                    output_path,
+                    new_prompt,
+                    session_data,
+                    sidebar_settings,
+                    creative_brief,
+                    seed=seed_value,
+                    persona=persona,
+                ),
+                seed_base=chain_idx * 1000 + step * 10,
+                fallback_scorer=lambda seed_value: _score_image_with_logprobs(
                     openai_client,
                     output_path,
                     new_prompt,
@@ -1181,16 +1846,22 @@ def _run_base_optimizer_chain(
                     creative_brief,
                     seed=seed_value,
                 ),
-                repeats=judge_repeats,
-                seed_base=chain_idx * 1000 + step * 10,
+                fallback_repeats=judge_repeats,
             )
             score = scored["score"]
             probs = scored["probs"]
             score_mode = scored.get("mode")
+            score_details = {
+                "mean_score": scored.get("mean_score"),
+                "persona_scores": scored.get("persona_scores"),
+                "persona_count": scored.get("persona_count"),
+                "score_aggregation": scored.get("score_aggregation"),
+            }
         else:
             score = 1.0
             probs = {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
             score_mode = "image-generation-failed"
+            score_details = None
 
         accepted = score > current["score"]
         step_entry = _build_candidate_record(
@@ -1201,6 +1872,7 @@ def _run_base_optimizer_chain(
             probs=probs,
             source="base",
             error=error,
+            score_details=score_details,
             score_mode=score_mode,
             strategy=revision.get("strategy"),
             accepted=accepted,
@@ -1321,18 +1993,22 @@ def _run_efficient_optimizer(
     worst_seeds: list[dict[str, Any]],
     optimization_steps: int,
     efficient_candidates: int,
+    gradient_steps: int,
     judge_repeats: int,
     report,
     report_image=None,
+    optimizer_label: str = "TextBO",
+    source: str = "efficient",
+    candidate_id_prefix: str = "efficient",
 ) -> dict[str, Any]:
     """Run the shared-history efficient optimizer from the same worst seeds."""
     trajectories: list[dict[str, Any]] = []
-    shared_history: list[dict[str, Any]] = [dict(seed) for seed in worst_seeds]
-    shared_reflection = _generate_shared_reflection(openai_client, shared_history)
+    shared_history: list[dict[str, Any]] = _shared_history_boundary_seeds(worst_seeds)
+    shared_reflection: str | None = None
     all_evaluated: list[dict[str, Any]] = []
     step_winners: list[dict[str, Any]] = []
     shared_reflection_history = [
-        {"step": 0, "reflection": shared_reflection, "history_size": len(shared_history)}
+        {"step": 0, "reflection": "No meta-reflection yet.", "history_size": len(shared_history)}
     ]
 
     for trajectory_idx, seed in enumerate(worst_seeds, start=1):
@@ -1351,13 +2027,13 @@ def _run_efficient_optimizer(
         max(1, len(trajectories)),
     )
     report(
-        f"Efficient optimizer running {len(trajectories)} trajectories with up to "
-        f"{trajectory_parallelism} parallel workers per step"
+        f"{optimizer_label} running {len(trajectories)} trajectories with up to "
+        f"{trajectory_parallelism} parallel workers per step | G={gradient_steps}, N={efficient_candidates}"
     )
 
     for step in range(1, optimization_steps + 1):
         report(
-            f"Efficient step {step}/{optimization_steps}: shared reflection refreshed across "
+            f"{optimizer_label} step {step}/{optimization_steps}: using shared history with "
             f"{len(shared_history)} evaluated prompts"
         )
 
@@ -1383,9 +2059,12 @@ def _run_efficient_optimizer(
                     },
                     step=step,
                     efficient_candidates=efficient_candidates,
+                    gradient_steps=gradient_steps,
                     judge_repeats=judge_repeats,
                     shared_history_snapshot=shared_history_snapshot,
                     shared_reflection=shared_reflection,
+                    source=source,
+                    candidate_id_prefix=candidate_id_prefix,
                 ): trajectory["trajectory_id"]
                 for trajectory in trajectories
             }
@@ -1414,19 +2093,27 @@ def _run_efficient_optimizer(
             "trajectory_id": step_winner_result["trajectory_id"],
             "score": step_winner_entry["score"],
             "prompt_prescore": step_winner_entry.get("prompt_prescore"),
+            "probs": step_winner_entry.get("probs"),
+            "score_details": step_winner_entry.get("score_details"),
+            "prompt_prescore_details": step_winner_entry.get("prompt_prescore_details"),
             "output_path": step_winner_entry.get("output_path"),
+            "error": step_winner_entry.get("error"),
             "prompt": step_winner_entry["prompt"],
             "strategy": step_winner_entry.get("strategy"),
             "candidate_id": step_winner_entry["candidate_id"],
             "score_mode": step_winner_entry.get("score_mode"),
             "prompt_prescore_mode": step_winner_entry.get("prompt_prescore_mode"),
+            "debug_traceback": step_winner_entry.get("debug_traceback"),
+            "source": source,
+            "selection_mode": step_winner_entry.get("selection_mode"),
+            "tournament_candidate_count": step_winner_entry.get("tournament_candidate_count"),
+            "gradient_steps": step_winner_entry.get("gradient_steps"),
         }
         step_winners.append(step_winner)
         report(
-            f"Efficient step {step}/{optimization_steps} winner: trajectory "
-            f"{step_winner['trajectory_id']} | pre-score "
-            f"{_format_score(step_winner['prompt_prescore'] or 0.0)} "
-            f"({step_winner.get('prompt_prescore_mode') or 'unknown'}) | "
+            f"{optimizer_label} step {step}/{optimization_steps} tournament winner: trajectory "
+            f"{step_winner['trajectory_id']} | G={step_winner.get('gradient_steps') or gradient_steps} | "
+            f"candidates {step_winner.get('tournament_candidate_count') or 0} | "
             f"final score {_format_score(step_winner['score'])} "
             f"({step_winner.get('score_mode') or 'unknown'})"
         )
@@ -1434,20 +2121,22 @@ def _run_efficient_optimizer(
             report_image(
                 step_winner["output_path"],
                 caption=(
-                    f"Efficient step {step} winner | trajectory {step_winner['trajectory_id']} | "
+                    f"{optimizer_label} step {step} winner | trajectory {step_winner['trajectory_id']} | "
                     f"score {_format_score(step_winner['score'])} "
                     f"({step_winner.get('score_mode') or 'unknown'})"
                 ),
             )
 
-        shared_reflection = _generate_shared_reflection(openai_client, shared_history)
-        shared_reflection_history.append(
-            {
-                "step": step,
-                "reflection": shared_reflection,
-                "history_size": len(shared_history),
-            }
-        )
+        if len(shared_history) >= 3:
+            recent_history = shared_history[-min(10, len(shared_history)) :]
+            shared_reflection = _generate_shared_reflection(openai_client, recent_history)
+            shared_reflection_history.append(
+                {
+                    "step": step,
+                    "reflection": shared_reflection,
+                    "history_size": len(shared_history),
+                }
+            )
 
     best_overall = max([trajectory["best"] for trajectory in trajectories], key=lambda item: item["score"])
     return {
@@ -1456,6 +2145,40 @@ def _run_efficient_optimizer(
         "best": best_overall,
         "step_winners": step_winners,
         "shared_reflection_history": shared_reflection_history,
+    }
+
+
+def _noop_report(*_args, **_kwargs) -> None:
+    """Swallow background optimizer progress updates."""
+
+
+def _build_textbo_baseline_comparison(
+    textbo_results: dict[str, Any],
+    baseline_results: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build a compact final comparison between TextBO and the hidden baseline."""
+    if not baseline_results:
+        return None
+
+    textbo_best = textbo_results["best"]
+    baseline_best = baseline_results["best"]
+    score_delta = textbo_best["score"] - baseline_best["score"]
+    if score_delta > 0:
+        winner = "textbo"
+    elif score_delta < 0:
+        winner = "hidden_baseline"
+    else:
+        winner = "tie"
+
+    return {
+        "textbo_best": textbo_best,
+        "hidden_baseline_best": baseline_best,
+        "score_delta": score_delta,
+        "winner": winner,
+        "hidden_baseline_config": {
+            "best_of_n": HIDDEN_BASELINE_CANDIDATES,
+            "gradient_steps_per_iteration": HIDDEN_BASELINE_GRADIENT_STEPS,
+        },
     }
 
 
@@ -1474,6 +2197,7 @@ def _run_search_pipeline(
     lowest_prompt_count: int,
     optimization_steps: int,
     efficient_candidates: int,
+    textbo_gradient_steps: int,
     judge_repeats: int,
     report,
     report_image=None,
@@ -1487,6 +2211,11 @@ def _run_search_pipeline(
         has_style_image=(model_key == "gemini" and style_image_bytes is not None),
     )
     report(f"Base prompt ready ({len(base_prompt.split())} words)")
+    personas = _load_personas()
+    report(
+        f"Persona evaluator loaded {len(personas)} local personas; using "
+        f"{min(DEFAULT_PERSONA_COUNT, len(personas))} per evaluation"
+    )
 
     prompt_variants = _generate_initial_prompt_variants(
         openai_client,
@@ -1591,7 +2320,7 @@ def _run_search_pipeline(
         entry["worst_rank"] = rank
 
     report(
-        f"Selected {len(worst_pool)} lowest-scoring starting points for both optimizers"
+        f"Selected {len(worst_pool)} lowest-scoring starting points for all optimizers"
     )
 
     base_results = _run_base_optimizer(
@@ -1610,7 +2339,13 @@ def _run_search_pipeline(
         report=report,
     )
 
-    efficient_results = _run_efficient_optimizer(
+    report(
+        "Hidden Best-of-N=1 baseline started from the same starting points "
+        f"for {optimization_steps} iterations"
+    )
+    baseline_executor = ThreadPoolExecutor(max_workers=1)
+    baseline_future = baseline_executor.submit(
+        _run_efficient_optimizer,
         openai_client=openai_client,
         gemini_key=gemini_key,
         model_key=model_key,
@@ -1620,12 +2355,76 @@ def _run_search_pipeline(
         session_data=session_data,
         sidebar_settings=sidebar_settings,
         creative_brief=creative_brief,
-        worst_seeds=worst_pool,
+        worst_seeds=[dict(seed) for seed in worst_pool],
         optimization_steps=optimization_steps,
-        efficient_candidates=efficient_candidates,
+        efficient_candidates=HIDDEN_BASELINE_CANDIDATES,
+        gradient_steps=HIDDEN_BASELINE_GRADIENT_STEPS,
         judge_repeats=judge_repeats,
-        report=report,
-        report_image=report_image,
+        report=_noop_report,
+        report_image=None,
+        optimizer_label="Hidden Best-of-N=1 baseline",
+        source="best_of_n_1_baseline",
+        candidate_id_prefix="bestof1",
+    )
+    hidden_baseline_results: dict[str, Any] | None = None
+    hidden_baseline_error: dict[str, str] | None = None
+
+    try:
+        efficient_results = _run_efficient_optimizer(
+            openai_client=openai_client,
+            gemini_key=gemini_key,
+            model_key=model_key,
+            aspect_ratio=aspect_ratio,
+            gpt_image_quality=gpt_image_quality,
+            style_image_bytes=style_image_bytes,
+            session_data=session_data,
+            sidebar_settings=sidebar_settings,
+            creative_brief=creative_brief,
+            worst_seeds=worst_pool,
+            optimization_steps=optimization_steps,
+            efficient_candidates=efficient_candidates,
+            gradient_steps=textbo_gradient_steps,
+            judge_repeats=judge_repeats,
+            report=report,
+            report_image=report_image,
+            optimizer_label="TextBO",
+            source="textbo",
+            candidate_id_prefix="textbo",
+        )
+    except Exception:
+        if not baseline_future.done():
+            baseline_future.cancel()
+        baseline_executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        if not baseline_future.done():
+            report("TextBO complete; waiting for hidden Best-of-N=1 baseline")
+        baseline_executor.shutdown(wait=True)
+
+    try:
+        hidden_baseline_results = baseline_future.result()
+        report(
+            "Hidden Best-of-N=1 baseline complete: best score "
+            f"{_format_score(hidden_baseline_results['best']['score'])}"
+        )
+    except Exception as exc:
+        traceback_text = _format_exception_traceback(exc)
+        hidden_baseline_error = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback_text,
+        }
+        _record_debug_event(
+            "hidden-baseline",
+            f"Hidden Best-of-N=1 baseline failed: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+            traceback_text=traceback_text,
+        )
+        report(f"Hidden Best-of-N=1 baseline failed: {exc}")
+
+    textbo_baseline_comparison = _build_textbo_baseline_comparison(
+        efficient_results,
+        hidden_baseline_results,
     )
 
     overall_best = max(
@@ -1645,12 +2444,21 @@ def _run_search_pipeline(
         "worst_pool": worst_pool,
         "base": base_results,
         "efficient": efficient_results,
+        "hidden_baseline": hidden_baseline_results,
+        "hidden_baseline_error": hidden_baseline_error,
+        "textbo_baseline_comparison": textbo_baseline_comparison,
         "overall_best": overall_best,
         "config": {
             "initial_prompt_count": initial_prompt_count,
             "lowest_prompt_count": lowest_prompt_count,
             "optimization_steps": optimization_steps,
             "efficient_candidates": efficient_candidates,
+            "textbo_gradient_steps": textbo_gradient_steps,
+            "hidden_baseline_candidates": HIDDEN_BASELINE_CANDIDATES,
+            "hidden_baseline_gradient_steps": HIDDEN_BASELINE_GRADIENT_STEPS,
+            "persona_count": min(DEFAULT_PERSONA_COUNT, len(_load_personas())),
+            "available_persona_count": len(_load_personas()),
+            "persona_dir": PERSONA_DIR,
             "judge_repeats": judge_repeats,
             "model": sidebar_settings.get("model"),
             "resolution": sidebar_settings.get("resolution"),
@@ -1661,6 +2469,21 @@ def _run_search_pipeline(
 def _render_probs(probs: dict[str, float]) -> str:
     """Render a compact probability summary."""
     return " | ".join(f"{k}: {probs.get(k, 0.0):.2f}" for k in ["1", "2", "3", "4", "5"])
+
+
+def _render_persona_score_details(details: dict[str, Any] | None, label: str = "Persona scores") -> None:
+    """Render compact per-persona scores when present."""
+    if not details or not details.get("persona_scores"):
+        return
+    persona_scores = details["persona_scores"]
+    score_text = " | ".join(
+        f"pid {persona_id}: {_format_score(score)}"
+        for persona_id, score in sorted(persona_scores.items())
+    )
+    mean_score = details.get("mean_score")
+    if mean_score is not None:
+        score_text = f"mean {_format_score(mean_score)} | {score_text}"
+    st.caption(f"{label}: {score_text}")
 
 
 def _format_score(score: float) -> str:
@@ -1708,6 +2531,11 @@ def _render_candidate_gallery(
                 with st.expander("Prompt", expanded=False):
                     st.code(candidate["prompt"], language="text")
                 st.caption(_render_probs(candidate["probs"]))
+                _render_persona_score_details(candidate.get("score_details"))
+                _render_persona_score_details(
+                    candidate.get("prompt_prescore_details"),
+                    label="Prompt persona pre-scores",
+                )
                 if candidate.get("strategy"):
                     st.markdown(f"**Strategy:** {candidate['strategy']}")
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -1748,26 +2576,36 @@ def _render_base_results(results: dict[str, Any]) -> None:
                 )
 
 
-def _render_efficient_results(results: dict[str, Any]) -> None:
-    """Render efficient optimizer results."""
-    st.subheader("Efficient Search")
-    best = results["best"]
-    st.markdown(
-        f"Best efficient result: **{_format_score(best['score'])}** "
-        f"({best.get('score_mode', 'unknown')}) from seed `{best.get('start_seed_id', 'n/a')}`."
-    )
+def _render_textbo_iteration_winners(winners: list[dict[str, Any]]) -> None:
+    """Render the best TextBO candidate at each parallel iteration."""
+    st.subheader("TextBO Middle Outcomes")
+    st.caption("Best rendered candidate at each iteration across parallel TextBO trajectories.")
+    if not winners:
+        st.info("No middle outcomes available.")
+        return
 
-    if results.get("step_winners"):
-        with st.expander("Step Winners", expanded=False):
-            for winner in results["step_winners"]:
+    for idx in range(0, len(winners), 2):
+        cols = st.columns(2, gap="large")
+        for col, winner in zip(cols, winners[idx : idx + 2]):
+            with col:
+                st.markdown('<div class="output-card">', unsafe_allow_html=True)
                 st.markdown(
-                    f"**Step {winner['step']}** | "
-                    f"trajectory {winner['trajectory_id']} | "
-                    f"pre-score {_format_score(winner.get('prompt_prescore') or 0.0)} "
-                    f"({winner.get('prompt_prescore_mode', 'unknown')}) | "
-                    f"final score {_format_score(winner['score'])} "
-                    f"({winner.get('score_mode', 'unknown')})"
+                    f"**Iteration {winner['step']}** | trajectory {winner['trajectory_id']}  \n"
+                    f"**Score:** {_format_score(winner['score'])} "
+                    f"({winner.get('score_mode', 'unknown')})  \n"
+                    f"**Selection:** {winner.get('selection_mode') or winner.get('prompt_prescore_mode', 'unknown')}"
                 )
+                if winner.get("gradient_steps"):
+                    st.caption(
+                        f"G={winner['gradient_steps']} | "
+                        f"rendered candidates={winner.get('tournament_candidate_count', 0)}"
+                    )
+                if winner.get("prompt_prescore") is not None:
+                    st.caption(
+                        "Prompt pre-score: "
+                        f"{_format_score(winner['prompt_prescore'])} "
+                        f"({winner.get('prompt_prescore_mode', 'unknown')})"
+                    )
                 if winner.get("output_path"):
                     st.image(winner["output_path"], use_container_width=True)
                 elif winner.get("error"):
@@ -1775,10 +2613,31 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                     if st.session_state.get("debug_mode") and winner.get("debug_traceback"):
                         with st.expander("Traceback", expanded=False):
                             st.code(winner["debug_traceback"], language="python")
-                with st.expander(f"Winning Prompt For Step {winner['step']}", expanded=False):
+                with st.expander(f"Winning Prompt For Iteration {winner['step']}", expanded=False):
                     st.code(winner["prompt"], language="text")
+                if winner.get("probs"):
+                    st.caption(_render_probs(winner["probs"]))
+                _render_persona_score_details(winner.get("score_details"))
+                _render_persona_score_details(
+                    winner.get("prompt_prescore_details"),
+                    label="Prompt persona pre-scores",
+                )
                 if winner.get("strategy"):
-                    st.caption(winner["strategy"])
+                    st.markdown(f"**Strategy:** {winner['strategy']}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_efficient_results(results: dict[str, Any]) -> None:
+    """Render TextBO optimizer results."""
+    st.subheader("TextBO Search")
+    best = results["best"]
+    st.markdown(
+        f"Best TextBO result: **{_format_score(best['score'])}** "
+        f"({best.get('score_mode', 'unknown')}) from seed `{best.get('start_seed_id', 'n/a')}`."
+    )
+
+    if results.get("step_winners"):
+        _render_textbo_iteration_winners(results["step_winners"])
 
     with st.expander("Shared Reflections", expanded=False):
         for item in results["shared_reflection_history"]:
@@ -1807,10 +2666,19 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
             st.code(seed["prompt"], language="text")
 
             for step_entry in trajectory["steps"]:
+                if step_entry.get("prompt_prescore") is not None:
+                    selection_text = (
+                        f"pre-score {_format_score(step_entry.get('prompt_prescore', 0.0))} "
+                        f"({step_entry.get('prompt_prescore_mode', 'unknown')})"
+                    )
+                else:
+                    selection_text = (
+                        f"{step_entry.get('selection_mode', 'image-tournament')} "
+                        f"over {step_entry.get('tournament_candidate_count', 0)} candidates"
+                    )
                 st.markdown(
                     f"**Step {step_entry['step']}** | "
-                    f"pre-score {_format_score(step_entry.get('prompt_prescore', 0.0))} "
-                    f"({step_entry.get('prompt_prescore_mode', 'unknown')}) | "
+                    f"{selection_text} | "
                     f"final score {_format_score(step_entry['score'])} "
                     f"({step_entry.get('score_mode', 'unknown')})"
                 )
@@ -1821,20 +2689,101 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
                     if st.session_state.get("debug_mode") and step_entry.get("debug_traceback"):
                         with st.expander("Traceback", expanded=False):
                             st.code(step_entry["debug_traceback"], language="python")
+                _render_persona_score_details(step_entry.get("score_details"))
                 if step_entry.get("candidate_prompts"):
                     with st.expander(
-                        f"Prompt Candidates For Step {step_entry['step']}",
+                        f"Best-of-N Candidates For Step {step_entry['step']}",
                         expanded=False,
                     ):
                         for cand in step_entry["candidate_prompts"]:
-                            st.markdown(
-                                f"- pre-score {_format_score(cand['score'])} "
-                                f"({cand.get('mode', 'unknown')}) | "
-                                f"{_prompt_excerpt(cand['prompt'], 260)}"
-                            )
+                            if cand.get("score") is not None:
+                                st.markdown(
+                                    f"- pre-score {_format_score(cand['score'])} "
+                                    f"({cand.get('mode', 'unknown')}) | "
+                                    f"{_prompt_excerpt(cand['prompt'], 260)}"
+                                )
+                                _render_persona_score_details(
+                                    cand.get("details"),
+                                    label="Prompt persona pre-scores",
+                                )
+                            else:
+                                selected_label = " | tournament winner" if cand.get("selected") else ""
+                                image_label = "image ready" if cand.get("output_path") else "image failed"
+                                st.markdown(
+                                    f"- G{cand.get('gradient_step', '?')} candidate {cand.get('candidate_idx')} | {image_label}"
+                                    f"{selected_label} | {_prompt_excerpt(cand.get('prompt', ''), 260)}"
+                                )
+                                if cand.get("error"):
+                                    st.caption(cand["error"])
                 st.code(step_entry["prompt"], language="text")
                 if step_entry.get("strategy"):
                     st.caption(step_entry["strategy"])
+
+
+def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
+    """Render final TextBO versus hidden N=1 baseline comparison."""
+    comparison = results.get("textbo_baseline_comparison")
+    baseline_error = results.get("hidden_baseline_error")
+
+    st.subheader("TextBO vs Hidden N=1 Baseline")
+    st.caption(
+        "Hidden baseline uses the same starting prompts and iteration count, with "
+        "Best of N = 1 and one revision step per iteration."
+    )
+
+    if baseline_error:
+        st.warning(
+            "Hidden baseline comparison is unavailable: "
+            f"{baseline_error.get('error_type', 'Error')}: {baseline_error.get('message', '')}"
+        )
+        if st.session_state.get("debug_mode") and baseline_error.get("traceback"):
+            with st.expander("Hidden Baseline Traceback", expanded=False):
+                st.code(baseline_error["traceback"], language="python")
+        return
+
+    if not comparison:
+        st.info("Hidden baseline comparison is unavailable for this run.")
+        return
+
+    textbo_best = comparison["textbo_best"]
+    baseline_best = comparison["hidden_baseline_best"]
+    score_delta = comparison["score_delta"]
+    winner_label = {
+        "textbo": "TextBO",
+        "hidden_baseline": "Hidden N=1 baseline",
+        "tie": "Tie",
+    }.get(comparison["winner"], comparison["winner"])
+
+    metric_cols = st.columns(3)
+    with metric_cols[0]:
+        st.metric("TextBO Best", _format_score(textbo_best["score"]))
+    with metric_cols[1]:
+        st.metric("Hidden N=1 Best", _format_score(baseline_best["score"]))
+    with metric_cols[2]:
+        st.metric("TextBO Delta", f"{score_delta:+.6f}")
+    st.markdown(f"Final comparison winner: **{winner_label}**")
+
+    outcome_cols = st.columns(2, gap="large")
+    for col, title, candidate in [
+        (outcome_cols[0], "TextBO Final Outcome", textbo_best),
+        (outcome_cols[1], "Hidden N=1 Baseline Outcome", baseline_best),
+    ]:
+        with col:
+            st.markdown(f"**{title}**")
+            st.markdown(
+                f"Score: **{_format_score(candidate['score'])}** "
+                f"({candidate.get('score_mode', 'unknown')})  \n"
+                f"Source: `{candidate.get('source', 'unknown')}`"
+            )
+            if candidate.get("output_path"):
+                st.image(candidate["output_path"], use_container_width=True)
+            else:
+                st.warning(candidate.get("error") or "Image generation failed.")
+            with st.expander(f"{title} Prompt", expanded=False):
+                st.code(candidate["prompt"], language="text")
+            _render_persona_score_details(candidate.get("score_details"))
+            if candidate.get("strategy"):
+                st.caption(candidate["strategy"])
 
 
 def _render_run_diagnostics() -> None:
@@ -2082,11 +3031,19 @@ with st.sidebar:
         step=1,
     )
     efficient_candidates = st.number_input(
-        "Efficient prompt candidates / step",
+        "TextBO best-of-N candidates / gradient step",
         min_value=1,
         max_value=5,
         value=DEFAULT_EFFICIENT_CANDIDATES,
         step=1,
+    )
+    textbo_gradient_steps = st.number_input(
+        "TextBO gradient steps / iteration",
+        min_value=2,
+        max_value=10,
+        value=DEFAULT_TEXTBO_GRADIENT_STEPS,
+        step=1,
+        help="Visible TextBO uses G > 1. The hidden N=1 baseline remains fixed at G=1.",
     )
 
     st.divider()
@@ -2153,7 +3110,7 @@ if not st.session_state.messages:
         <h2>Welcome to Ad Campaign Agent Optimizer</h2>
         <p>Choose a model and visual style in the sidebar, then describe your campaign.
         After you approve the brief, the app will seed multiple prompts, score them,
-        and run both base and efficient prompt-search loops.</p>
+        and run the base and TextBO prompt-search loops.</p>
     </div>
     """,
         unsafe_allow_html=True,
@@ -2222,6 +3179,7 @@ def _run_optimization() -> None:
                     lowest_prompt_count=int(lowest_prompt_count),
                     optimization_steps=int(optimization_steps),
                     efficient_candidates=int(efficient_candidates),
+                    textbo_gradient_steps=int(textbo_gradient_steps),
                     judge_repeats=DEFAULT_JUDGE_REPEATS,
                     report=st.write,
                     report_image=_status_report_image,
@@ -2233,7 +3191,7 @@ def _run_optimization() -> None:
         st.session_state.phase = "done"
         response_text = (
             "Search finished. The initial prompts, the lowest-performing seeds, and the "
-            "base and efficient optimizer results are shown below."
+            "base, TextBO, and hidden N=1 baseline comparison results are shown below."
         )
         st.session_state.messages.append({"role": "assistant", "content": response_text})
         st.rerun()
@@ -2360,14 +3318,20 @@ if st.session_state.optimization_results:
     st.divider()
     st.header("Search Results")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    metric_cols = st.columns(4 if results.get("hidden_baseline") else 3)
+    with metric_cols[0]:
         best_initial = max(results["initial_candidates"], key=lambda item: item["score"])
         st.metric("Best Initial", _format_score(best_initial["score"]))
-    with col2:
+    with metric_cols[1]:
         st.metric("Best Base", _format_score(results["base"]["best"]["score"]))
-    with col3:
-        st.metric("Best Efficient", _format_score(results["efficient"]["best"]["score"]))
+    with metric_cols[2]:
+        st.metric("Best TextBO", _format_score(results["efficient"]["best"]["score"]))
+    if results.get("hidden_baseline"):
+        with metric_cols[3]:
+            st.metric(
+                "Hidden N=1",
+                _format_score(results["hidden_baseline"]["best"]["score"]),
+            )
 
     st.markdown(
         f"**Overall best score:** {_format_score(overall_best['score'])} "
@@ -2377,6 +3341,8 @@ if st.session_state.optimization_results:
         st.image(overall_best["output_path"], use_container_width=True)
     with st.expander("Overall Best Prompt", expanded=False):
         st.code(overall_best["prompt"], language="text")
+
+    _render_textbo_baseline_comparison(results)
 
     download_payload = json.dumps(results, indent=2, ensure_ascii=False)
     st.download_button(
@@ -2392,7 +3358,7 @@ if st.session_state.optimization_results:
             "Initial",
             f"Lowest {len(results['worst_pool'])}",
             "Base",
-            "Efficient",
+            "TextBO",
         ]
     )
     with tabs[0]:
