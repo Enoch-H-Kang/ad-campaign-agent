@@ -443,8 +443,8 @@ def _history_summary(
 def _reflection_examples(
     candidates: list[dict[str, Any]],
     *,
-    top_n: int = 4,
-    bottom_n: int = 4,
+    top_n: int = 5,
+    bottom_n: int = 5,
 ) -> list[dict[str, Any]]:
     """Select ranked high/low examples for multimodal reflection."""
     if not candidates:
@@ -1046,7 +1046,7 @@ Requirements:
         system_prompt,
         user_prompt,
         model=PROMPT_GENERATION_MODEL,
-        temperature=0.8,
+        temperature=2.0,
         top_p=0.9,
         max_completion_tokens=8192,
     )
@@ -1124,7 +1124,7 @@ def _generate_shared_reflection(
 
 Review the prompt history below as a fallback when rendered images are unavailable. Infer visual patterns that distinguish lower-scoring from higher-scoring ad iterations.
 
-{_history_summary(shared_history, top_n=4, bottom_n=4)}
+{_history_summary(shared_history, top_n=5, bottom_n=5)}
 
 RESPONSE FORMAT:
 Provide a structured analysis of visual patterns observed, focusing on what distinguishes high-performing from low-performing ads.
@@ -1147,8 +1147,8 @@ Cover composition, lighting, color palette, subject positioning, brand integrati
 
     multimodal_content = _build_multimodal_reflection_content(
         shared_history,
-        top_n=4,
-        bottom_n=4,
+        top_n=5,
+        bottom_n=5,
     )
     if not multimodal_content:
         return _text_only_reflection()
@@ -1254,12 +1254,12 @@ Be concise but specific. Prefer changes large enough to produce visibly differen
         return _request_text(
             client,
             "You generate textual gradients for advertising prompt optimization.",
-            user_prompt,
-            model=PROMPT_GENERATION_MODEL,
-            temperature=0.8,
-            top_p=0.9,
-            max_completion_tokens=2048,
-        )
+        user_prompt,
+        model=PROMPT_GENERATION_MODEL,
+        temperature=1.0,
+        top_p=0.9,
+        max_completion_tokens=2048,
+    )
     except Exception:
         return "Improve visual appeal and emotional connection with the target audience."
 
@@ -1288,7 +1288,6 @@ REQUIREMENTS:
 - Integrate the improvement suggestions naturally into a self-contained image-generation prompt.
 - Maintain coherence and readability.
 - Ensure the prompt is optimized for image generation.
-- Keep the prompt length reasonable and under 220 words.
 
 Return ONLY the revised prompt, no explanations or additional text."""
     try:
@@ -2015,6 +2014,33 @@ def _shared_history_boundary_seeds(seeds: list[dict[str, Any]]) -> list[dict[str
     return [dict(seeds[0]), dict(seeds[-1])]
 
 
+def _merge_shared_history(
+    initial_history: list[dict[str, Any]] | None,
+    boundary_seeds: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Initialize shared history from initial evaluations while preserving boundary seeds."""
+    shared_history: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for entry in initial_history or []:
+        candidate_id = str(entry.get("candidate_id") or "")
+        if candidate_id and candidate_id in seen_ids:
+            continue
+        shared_history.append(dict(entry))
+        if candidate_id:
+            seen_ids.add(candidate_id)
+
+    for seed in boundary_seeds:
+        candidate_id = str(seed.get("candidate_id") or "")
+        if candidate_id and candidate_id in seen_ids:
+            continue
+        shared_history.append(dict(seed))
+        if candidate_id:
+            seen_ids.add(candidate_id)
+
+    return shared_history
+
+
 def _run_base_optimizer_chain(
     *,
     openai_client,
@@ -2235,15 +2261,22 @@ def _run_efficient_optimizer(
     optimizer_label: str = "TextBO",
     source: str = "efficient",
     candidate_id_prefix: str = "efficient",
+    initial_shared_history: list[dict[str, Any]] | None = None,
+    initial_shared_reflection: str | None = None,
 ) -> dict[str, Any]:
     """Run the shared-history efficient optimizer from the same worst seeds."""
     trajectories: list[dict[str, Any]] = []
-    shared_history: list[dict[str, Any]] = _shared_history_boundary_seeds(worst_seeds)
-    shared_reflection: str | None = None
+    boundary_seeds = _shared_history_boundary_seeds(worst_seeds)
+    shared_history = _merge_shared_history(initial_shared_history, boundary_seeds)
+    shared_reflection: str | None = initial_shared_reflection
     all_evaluated: list[dict[str, Any]] = []
     step_winners: list[dict[str, Any]] = []
     shared_reflection_history = [
-        {"step": 0, "reflection": "No meta-reflection yet.", "history_size": len(shared_history)}
+        {
+            "step": 0,
+            "reflection": shared_reflection or "No meta-reflection yet.",
+            "history_size": len(shared_history),
+        }
     ]
 
     for trajectory_idx, seed in enumerate(worst_seeds, start=1):
@@ -2398,7 +2431,7 @@ def _build_textbo_baseline_comparison(
     textbo_results: dict[str, Any],
     baseline_results: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Build a compact final comparison between TextBO and the hidden baseline."""
+    """Build a compact final comparison between TextBO and Base N=1, G=1."""
     if not baseline_results:
         return None
 
@@ -2565,24 +2598,20 @@ def _run_search_pipeline(
         f"Selected {len(worst_pool)} lowest-scoring starting points for all optimizers"
     )
 
-    base_results = _run_base_optimizer(
-        openai_client=openai_client,
-        gemini_key=gemini_key,
-        model_key=model_key,
-        aspect_ratio=aspect_ratio,
-        gpt_image_quality=gpt_image_quality,
-        style_image_bytes=style_image_bytes,
-        session_data=session_data,
-        sidebar_settings=sidebar_settings,
-        creative_brief=creative_brief,
-        worst_seeds=worst_pool,
-        optimization_steps=optimization_steps,
-        judge_repeats=judge_repeats,
-        report=report,
-    )
+    initial_shared_history = [dict(item) for item in successful_initial]
+    initial_shared_reflection = None
+    if len(initial_shared_history) >= 2:
+        report(
+            "Building initial reflection from evaluated initial ads "
+            f"({len(initial_shared_history)} examples)"
+        )
+        initial_shared_reflection = _generate_shared_reflection(
+            openai_client,
+            initial_shared_history,
+        )
 
     report(
-        "Hidden Best-of-N=1 baseline started from the same starting points "
+        "Base N=1, G=1 baseline started from the same starting points "
         f"for {optimization_steps} iterations"
     )
     baseline_executor = ThreadPoolExecutor(max_workers=1)
@@ -2604,9 +2633,11 @@ def _run_search_pipeline(
         judge_repeats=judge_repeats,
         report=_noop_report,
         report_image=None,
-        optimizer_label="Hidden Best-of-N=1 baseline",
-        source="best_of_n_1_baseline",
-        candidate_id_prefix="bestof1",
+        optimizer_label="Base N=1, G=1",
+        source="base",
+        candidate_id_prefix="base",
+        initial_shared_history=[dict(item) for item in initial_shared_history],
+        initial_shared_reflection=initial_shared_reflection,
     )
     hidden_baseline_results: dict[str, Any] | None = None
     hidden_baseline_error: dict[str, str] | None = None
@@ -2632,6 +2663,8 @@ def _run_search_pipeline(
             optimizer_label="TextBO",
             source="textbo",
             candidate_id_prefix="textbo",
+            initial_shared_history=[dict(item) for item in initial_shared_history],
+            initial_shared_reflection=initial_shared_reflection,
         )
     except Exception:
         if not baseline_future.done():
@@ -2640,13 +2673,13 @@ def _run_search_pipeline(
         raise
     else:
         if not baseline_future.done():
-            report("TextBO complete; waiting for hidden Best-of-N=1 baseline")
+            report("TextBO complete; waiting for Base N=1, G=1 baseline")
         baseline_executor.shutdown(wait=True)
 
     try:
         hidden_baseline_results = baseline_future.result()
         report(
-            "Hidden Best-of-N=1 baseline complete: best score "
+            "Base N=1, G=1 baseline complete: best score "
             f"{_format_score(hidden_baseline_results['best']['score'])}"
         )
     except Exception as exc:
@@ -2658,25 +2691,24 @@ def _run_search_pipeline(
         }
         _record_debug_event(
             "hidden-baseline",
-            f"Hidden Best-of-N=1 baseline failed: {type(exc).__name__}: {exc}",
+            f"Base N=1, G=1 baseline failed: {type(exc).__name__}: {exc}",
             error_type=type(exc).__name__,
             traceback_text=traceback_text,
         )
-        report(f"Hidden Best-of-N=1 baseline failed: {exc}")
+        report(f"Base N=1, G=1 baseline failed: {exc}")
 
     textbo_baseline_comparison = _build_textbo_baseline_comparison(
         efficient_results,
         hidden_baseline_results,
     )
 
-    overall_best = max(
-        [
-            max(ranked_initial, key=lambda item: item["score"]),
-            base_results["best"],
-            efficient_results["best"],
-        ],
-        key=lambda item: item["score"],
-    )
+    overall_candidates = [
+        max(ranked_initial, key=lambda item: item["score"]),
+        efficient_results["best"],
+    ]
+    if hidden_baseline_results:
+        overall_candidates.append(hidden_baseline_results["best"])
+    overall_best = max(overall_candidates, key=lambda item: item["score"])
 
     return {
         "base_prompt": base_prompt,
@@ -2684,7 +2716,8 @@ def _run_search_pipeline(
         "initial_candidates": initial_candidates,
         "initial_ranked": ranked_initial,
         "worst_pool": worst_pool,
-        "base": base_results,
+        "base": hidden_baseline_results,
+        "base_error": hidden_baseline_error,
         "efficient": efficient_results,
         "hidden_baseline": hidden_baseline_results,
         "hidden_baseline_error": hidden_baseline_error,
@@ -2823,10 +2856,10 @@ def _render_base_results(results: dict[str, Any]) -> None:
                 )
 
 
-def _render_textbo_iteration_winners(winners: list[dict[str, Any]]) -> None:
-    """Render the best TextBO candidate at each parallel iteration."""
-    st.subheader("TextBO Middle Outcomes")
-    st.caption("Best rendered candidate at each iteration across parallel TextBO trajectories.")
+def _render_textbo_iteration_winners(winners: list[dict[str, Any]], label: str = "TextBO") -> None:
+    """Render the best candidate at each parallel iteration."""
+    st.subheader(f"{label} Middle Outcomes")
+    st.caption(f"Best rendered candidate at each iteration across parallel {label} trajectories.")
     if not winners:
         st.info("No middle outcomes available.")
         return
@@ -2874,17 +2907,17 @@ def _render_textbo_iteration_winners(winners: list[dict[str, Any]]) -> None:
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _render_efficient_results(results: dict[str, Any]) -> None:
-    """Render TextBO optimizer results."""
-    st.subheader("TextBO Search")
+def _render_efficient_results(results: dict[str, Any], label: str = "TextBO") -> None:
+    """Render TextBO-style optimizer results."""
+    st.subheader(f"{label} Search")
     best = results["best"]
     st.markdown(
-        f"Best TextBO result: **{_format_score(best['score'])}** "
+        f"Best {label} result: **{_format_score(best['score'])}** "
         f"({best.get('score_mode', 'unknown')}) from seed `{best.get('start_seed_id', 'n/a')}`."
     )
 
     if results.get("step_winners"):
-        _render_textbo_iteration_winners(results["step_winners"])
+        _render_textbo_iteration_winners(results["step_winners"], label=label)
 
     with st.expander("Shared Reflections", expanded=False):
         for item in results["shared_reflection_history"]:
@@ -2968,28 +3001,28 @@ def _render_efficient_results(results: dict[str, Any]) -> None:
 
 
 def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
-    """Render final TextBO versus hidden N=1 baseline comparison."""
+    """Render final TextBO versus Base N=1, G=1 comparison."""
     comparison = results.get("textbo_baseline_comparison")
     baseline_error = results.get("hidden_baseline_error")
 
-    st.subheader("TextBO vs Hidden N=1 Baseline")
+    st.subheader("TextBO vs Base")
     st.caption(
-        "Hidden baseline uses the same starting prompts and iteration count, with "
+        "Base uses the same starting prompts and iteration count, with "
         "Best of N = 1 and one revision step per iteration."
     )
 
     if baseline_error:
         st.warning(
-            "Hidden baseline comparison is unavailable: "
+            "Base comparison is unavailable: "
             f"{baseline_error.get('error_type', 'Error')}: {baseline_error.get('message', '')}"
         )
         if st.session_state.get("debug_mode") and baseline_error.get("traceback"):
-            with st.expander("Hidden Baseline Traceback", expanded=False):
+            with st.expander("Base Traceback", expanded=False):
                 st.code(baseline_error["traceback"], language="python")
         return
 
     if not comparison:
-        st.info("Hidden baseline comparison is unavailable for this run.")
+        st.info("Base comparison is unavailable for this run.")
         return
 
     textbo_best = comparison["textbo_best"]
@@ -2997,7 +3030,7 @@ def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
     score_delta = comparison["score_delta"]
     winner_label = {
         "textbo": "TextBO",
-        "hidden_baseline": "Hidden N=1 baseline",
+        "hidden_baseline": "Base",
         "tie": "Tie",
     }.get(comparison["winner"], comparison["winner"])
 
@@ -3005,7 +3038,7 @@ def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
     with metric_cols[0]:
         st.metric("TextBO Best", _format_score(textbo_best["score"]))
     with metric_cols[1]:
-        st.metric("Hidden N=1 Best", _format_score(baseline_best["score"]))
+        st.metric("Base Best", _format_score(baseline_best["score"]))
     with metric_cols[2]:
         st.metric("TextBO Delta", f"{score_delta:+.6f}")
     st.markdown(f"Final comparison winner: **{winner_label}**")
@@ -3013,7 +3046,7 @@ def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
     outcome_cols = st.columns(2, gap="large")
     for col, title, candidate in [
         (outcome_cols[0], "TextBO Final Outcome", textbo_best),
-        (outcome_cols[1], "Hidden N=1 Baseline Outcome", baseline_best),
+        (outcome_cols[1], "Base Final Outcome", baseline_best),
     ]:
         with col:
             st.markdown(f"**{title}**")
@@ -3290,7 +3323,7 @@ with st.sidebar:
         max_value=10,
         value=DEFAULT_TEXTBO_GRADIENT_STEPS,
         step=1,
-        help="Visible TextBO uses G > 1. The hidden N=1 baseline remains fixed at G=1.",
+        help="Visible TextBO uses G > 1. Base remains fixed at N=1 and G=1.",
     )
 
     st.divider()
@@ -3357,7 +3390,7 @@ if not st.session_state.messages:
         <h2>Welcome to Ad Campaign Agent Optimizer</h2>
         <p>Choose a model and visual style in the sidebar, then describe your campaign.
         After you approve the brief, the app will seed multiple prompts, score them,
-        and run the base and TextBO prompt-search loops.</p>
+        and run the Base N=1/G=1 and TextBO prompt-search loops.</p>
     </div>
     """,
         unsafe_allow_html=True,
@@ -3438,7 +3471,7 @@ def _run_optimization() -> None:
         st.session_state.phase = "done"
         response_text = (
             "Search finished. The initial prompts, the lowest-performing seeds, and the "
-            "base, TextBO, and hidden N=1 baseline comparison results are shown below."
+            "Base N=1/G=1 and TextBO comparison results are shown below."
         )
         st.session_state.messages.append({"role": "assistant", "content": response_text})
         st.rerun()
@@ -3565,20 +3598,17 @@ if st.session_state.optimization_results:
     st.divider()
     st.header("Search Results")
 
-    metric_cols = st.columns(4 if results.get("hidden_baseline") else 3)
+    metric_cols = st.columns(3)
     with metric_cols[0]:
         best_initial = max(results["initial_candidates"], key=lambda item: item["score"])
         st.metric("Best Initial", _format_score(best_initial["score"]))
     with metric_cols[1]:
-        st.metric("Best Base", _format_score(results["base"]["best"]["score"]))
+        if results.get("base"):
+            st.metric("Best Base", _format_score(results["base"]["best"]["score"]))
+        else:
+            st.metric("Best Base", "n/a")
     with metric_cols[2]:
         st.metric("Best TextBO", _format_score(results["efficient"]["best"]["score"]))
-    if results.get("hidden_baseline"):
-        with metric_cols[3]:
-            st.metric(
-                "Hidden N=1",
-                _format_score(results["hidden_baseline"]["best"]["score"]),
-            )
 
     st.markdown(
         f"**Overall best score:** {_format_score(overall_best['score'])} "
@@ -3622,7 +3652,26 @@ if st.session_state.optimization_results:
             sort_desc=False,
         )
     with tabs[2]:
-        _render_base_results(results["base"])
+        if results.get("base"):
+            _render_efficient_results(results["base"], label="Base")
+        else:
+            base_error = results.get("base_error") or results.get("hidden_baseline_error")
+            st.subheader("Base")
+            st.warning(
+                "Base N=1, G=1 result is unavailable"
+                + (
+                    f": {base_error.get('error_type', 'Error')}: {base_error.get('message', '')}"
+                    if base_error
+                    else "."
+                )
+            )
+            if (
+                st.session_state.get("debug_mode")
+                and base_error
+                and base_error.get("traceback")
+            ):
+                with st.expander("Base Traceback", expanded=False):
+                    st.code(base_error["traceback"], language="python")
     with tabs[3]:
         _render_efficient_results(results["efficient"])
 
