@@ -1025,7 +1025,35 @@ def _generate_initial_prompt_variants(
         "You generate polished image-generation prompts for advertising creatives. "
         "Return JSON only."
     )
-    user_prompt = f"""Create {total_count - 1} additional image-generation prompts for the same campaign.
+    prompts = [base_prompt]
+    seen_prompt_text = {_normalize_prompt(base_prompt).lower()}
+    creative_routes = [
+        "product hero close-up with distinctive staging and tactile detail",
+        "adult lifestyle moment with a clear action and emotional hook",
+        "environment-led scene where the setting tells the campaign story",
+        "bold graphic/social-feed layout with strong negative space for copy",
+        "dynamic motion or before-after contrast that dramatizes the benefit",
+        "premium editorial composition with distinctive lighting and camera angle",
+        "social proof scene with adults interacting around the product or outcome",
+        "unexpected metaphorical visual that still makes the product and CTA clear",
+        "minimal studio product shot with unusual prop, surface, or color strategy",
+        "immersive point-of-view scene that puts the viewer inside the use case",
+    ]
+
+    for variant_idx in range(2, total_count + 1):
+        route = creative_routes[(variant_idx - 2) % len(creative_routes)]
+        generated_prompt = ""
+        for attempt in range(2):
+            prior_prompt_text = "\n".join(
+                f"- {_prompt_excerpt(prompt, max_chars=180)}"
+                for prompt in prompts
+            )
+            retry_note = (
+                ""
+                if attempt == 0
+                else "\nThe previous attempt was too similar. Choose a more different scene, camera language, and subject action."
+            )
+            user_prompt = f"""Create one highly distinct image-generation prompt for ad candidate #{variant_idx}.
 
 Locked campaign context:
 {campaign_context}
@@ -1033,27 +1061,53 @@ Locked campaign context:
 Approved base prompt:
 {base_prompt}
 
+Recently generated prompts to avoid repeating:
+{prior_prompt_text}
+
+Creative route for this candidate:
+{route}
+
 Requirements:
 - Keep the same product, audience, campaign goal, core message, tone, style direction, and aspect ratio.
-- Vary composition, scene setup, focal point, copy integration, camera framing, and visual emphasis enough to create genuinely different ad directions.
-- Each prompt must be self-contained and ready for image generation.
-- Keep each prompt concise and under 220 words.
-- Return JSON with one key: "prompts".
+- Make this candidate clearly different from every prior prompt above.
+- Use a different scene, setting, subject action, camera framing, visual hierarchy, and copy-placement strategy from the prior prompts whenever possible.
+- Focus on one strong, coherent ad idea rather than small wording changes.
+- If humans appear, use adults only.
+- The prompt must be self-contained and ready for image generation.
+- Keep the prompt concise and under 220 words.
+- Return JSON with one key: "prompt".
+{retry_note}
 """
 
-    payload = _request_json_object(
-        client,
-        system_prompt,
-        user_prompt,
-        model=PROMPT_GENERATION_MODEL,
-        temperature=2.0,
-        top_p=0.9,
-        max_completion_tokens=8192,
-    )
+            try:
+                payload = _request_json_object(
+                    client,
+                    system_prompt,
+                    user_prompt,
+                    model=PROMPT_GENERATION_MODEL,
+                    temperature=1.2,
+                    top_p=0.95,
+                    max_completion_tokens=2048,
+                )
+                prompt = _normalize_prompt(str(payload.get("prompt", "")).strip())
+            except Exception:
+                prompt = ""
 
-    prompts = [base_prompt]
-    if isinstance(payload.get("prompts"), list):
-        prompts.extend([str(item) for item in payload["prompts"] if isinstance(item, str)])
+            prompt_key = prompt.lower()
+            if prompt and prompt_key not in seen_prompt_text:
+                generated_prompt = prompt
+                break
+
+        if not generated_prompt:
+            generated_prompt = _normalize_prompt(
+                f"{base_prompt} Creative variation: {route}. Use a clearly different scene, "
+                "setting, subject action, camera framing, visual hierarchy, and copy-placement "
+                "strategy from the approved base prompt while preserving the same campaign."
+            )
+
+        if generated_prompt:
+            prompts.append(generated_prompt)
+            seen_prompt_text.add(generated_prompt.lower())
 
     prompts = _dedupe_prompts(prompts)
     while len(prompts) < total_count:
