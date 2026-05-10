@@ -57,6 +57,15 @@ Penalize generic product staging, vague audience fit, weak CTA visibility, unrea
 _PERSONA_CACHE: list[dict[str, str]] | None = None
 
 
+def _is_output_limit_error(exc: BaseException) -> bool:
+    """Detect OpenAI errors caused by an unfinished, overlong response."""
+    message = str(exc)
+    return (
+        "max_tokens or model output limit" in message
+        or "Could not finish the message" in message
+    )
+
+
 def _failure_probs() -> dict[str, float]:
     """Use a pessimistic fallback when scoring/parsing fails."""
     return {str(i): (1.0 if i == 1 else 0.0) for i in range(1, 6)}
@@ -142,16 +151,29 @@ def _request_text(
     max_completion_tokens: int = 4096,
 ) -> str:
     """Request plain text from GPT-5-nano."""
-    response = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=temperature,
-        max_completion_tokens=max_completion_tokens,
-    )
-    return (response.choices[0].message.content or "").strip()
+    token_limits = [max_completion_tokens]
+    if max_completion_tokens < 8192:
+        token_limits.append(8192)
+
+    last_exc: BaseException | None = None
+    for token_limit in token_limits:
+        try:
+            response = client.chat.completions.create(
+                model=TEXT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_completion_tokens=token_limit,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_output_limit_error(exc):
+                raise
+
+    raise last_exc
 
 
 def _prompt_excerpt(prompt: str, max_chars: int = 180) -> str:
@@ -904,8 +926,12 @@ def _generate_shared_reflection(
     shared_history: list[dict[str, Any]],
 ) -> str:
     """Summarize shared prompt patterns for the efficient optimizer."""
+    fallback_reflection = (
+        "Favor clear product focus, readable CTA space, campaign-specific context, "
+        "and simpler compositions over generic staging."
+    )
     if len(shared_history) < 2:
-        return "No strong shared pattern yet."
+        return fallback_reflection
 
     def _text_only_reflection() -> str:
         system_prompt = "You analyze ad-performance patterns from prompt history."
@@ -916,18 +942,21 @@ Review the prompt history below as a fallback when rendered images are unavailab
 {_history_summary(shared_history, top_n=4, bottom_n=4)}
 
 RESPONSE FORMAT:
-Provide a structured analysis of visual patterns observed, focusing on what distinguishes high-performing from low-performing ads.
-Cover composition, lighting, color palette, subject positioning, brand integration, and environmental elements. Focus on concrete changes future prompts should make.
+Return exactly 3 concise bullets, max 90 words total.
+Focus on concrete prompt changes future iterations should make.
 """
 
-        reflection = _request_text(
-            client,
-            system_prompt,
-            user_prompt,
-            temperature=1.0,
-            max_completion_tokens=2048,
-        )
-        return reflection or "No strong shared pattern yet."
+        try:
+            reflection = _request_text(
+                client,
+                system_prompt,
+                user_prompt,
+                temperature=0.7,
+                max_completion_tokens=4096,
+            )
+        except Exception:
+            return fallback_reflection
+        return reflection or fallback_reflection
 
     multimodal_content = _build_multimodal_reflection_content(
         shared_history,
@@ -950,8 +979,8 @@ Cover composition, lighting, color palette, subject positioning, brand integrati
                 "5. Brand integration approaches\n"
                 "6. Environmental and atmospheric elements\n\n"
                 "RESPONSE FORMAT:\n"
-                "Provide a structured analysis of visual patterns observed, focusing on "
-                "what distinguishes high-performing from low-performing ads."
+                "Return exactly 3 concise bullets, max 90 words total. Focus only on "
+                "concrete prompt changes future iterations should make."
             ),
         }
     )
@@ -962,8 +991,8 @@ Cover composition, lighting, color palette, subject positioning, brand integrati
             client,
             system_prompt,
             multimodal_content,
-            temperature=1.0,
-            max_completion_tokens=2048,
+            temperature=0.7,
+            max_completion_tokens=4096,
         )
     except Exception:
         return _text_only_reflection()
