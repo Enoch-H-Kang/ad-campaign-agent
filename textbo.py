@@ -11,6 +11,7 @@ import traceback
 from typing import Any
 
 import streamlit as st
+import tiktoken
 
 from agent import (
     build_generation_prompt,
@@ -34,7 +35,7 @@ HIDDEN_BASELINE_GRADIENT_STEPS = 1
 DEFAULT_JUDGE_REPEATS = 1
 DEFAULT_PERSONA_COUNT = 5
 MAX_PERSONA_FILES = 5
-MAX_PERSONA_CHARS = 50000
+MAX_PERSONA_TOKENS = 5000
 PERSONA_DIR = os.path.join(os.path.dirname(__file__), "persona")
 TOURNAMENT_COMPARISONS = 3
 DEFAULT_INITIAL_PARALLELISM = 10
@@ -249,11 +250,13 @@ def _load_personas() -> list[dict[str, str]]:
 
 
 def _persona_sample_text(persona: dict[str, str]) -> str:
-    """Return a bounded persona text sample for judge prompts."""
+    """Return the first persona tokens used in judge prompts."""
     text = persona.get("text", "")
-    if len(text) <= MAX_PERSONA_CHARS:
+    encoding = tiktoken.encoding_for_model(EVAL_MODEL)
+    tokens = encoding.encode(text)
+    if len(tokens) <= MAX_PERSONA_TOKENS:
         return text
-    return text[:MAX_PERSONA_CHARS] + "\n\n[Note: Content truncated]"
+    return encoding.decode(tokens[:MAX_PERSONA_TOKENS]).rstrip()
 
 
 def _campaign_context_text(
@@ -644,14 +647,6 @@ Do not explain your answer."""
         probs = _extract_digit_probs_from_completion(response)
         mode = "image-persona-logprobs" if persona else "image-logprobs"
     except Exception:
-        if persona:
-            probs = {str(i): 0.2 for i in range(1, 6)}
-            return {
-                "score": _score_from_probs(probs),
-                "probs": probs,
-                "mode": "image-persona-uniform-fallback",
-                "persona_id": persona.get("persona_id"),
-            }
         try:
             response = client.chat.completions.create(
                 model=EVAL_MODEL,
