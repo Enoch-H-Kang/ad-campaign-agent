@@ -25,6 +25,7 @@ from schema import STYLE_DIR, STYLE_PRESETS
 
 TEXT_MODEL = "gpt-5-nano"
 EVAL_MODEL = "gpt-4o"
+TEXT_REASONING_EFFORT = "minimal"
 DEFAULT_INITIAL_PROMPTS = 10
 DEFAULT_LOWEST_PROMPTS = 5
 DEFAULT_OPTIMIZATION_STEPS = 10
@@ -115,9 +116,18 @@ def _request_json_object(
     user_prompt: str | list[dict[str, Any]],
     *,
     temperature: float = 1.0,
+    top_p: float | None = None,
     max_completion_tokens: int = 8192,
 ) -> dict[str, Any]:
     """Request a JSON object from GPT-5-nano."""
+    request_kwargs = {
+        "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens,
+        "reasoning_effort": TEXT_REASONING_EFFORT,
+    }
+    if top_p is not None:
+        request_kwargs["top_p"] = top_p
+
     try:
         response = client.chat.completions.create(
             model=TEXT_MODEL,
@@ -125,9 +135,8 @@ def _request_json_object(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=temperature,
-            max_completion_tokens=max_completion_tokens,
             response_format={"type": "json_object"},
+            **request_kwargs,
         )
     except Exception:
         response = client.chat.completions.create(
@@ -136,8 +145,7 @@ def _request_json_object(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=temperature,
-            max_completion_tokens=max_completion_tokens,
+            **request_kwargs,
         )
     return _parse_json_text(response.choices[0].message.content or "{}")
 
@@ -148,6 +156,7 @@ def _request_text(
     user_prompt: str | list[dict[str, Any]],
     *,
     temperature: float = 1.0,
+    top_p: float | None = None,
     max_completion_tokens: int = 4096,
 ) -> str:
     """Request plain text from GPT-5-nano."""
@@ -157,6 +166,14 @@ def _request_text(
 
     last_exc: BaseException | None = None
     for token_limit in token_limits:
+        request_kwargs = {
+            "temperature": temperature,
+            "max_completion_tokens": token_limit,
+            "reasoning_effort": TEXT_REASONING_EFFORT,
+        }
+        if top_p is not None:
+            request_kwargs["top_p"] = top_p
+
         try:
             response = client.chat.completions.create(
                 model=TEXT_MODEL,
@@ -164,8 +181,7 @@ def _request_text(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=temperature,
-                max_completion_tokens=token_limit,
+                **request_kwargs,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception as exc:
@@ -864,7 +880,8 @@ Requirements:
         client,
         system_prompt,
         user_prompt,
-        temperature=1.0,
+        temperature=0.8,
+        top_p=0.9,
         max_completion_tokens=8192,
     )
 
@@ -913,7 +930,8 @@ Task:
         client,
         system_prompt,
         user_prompt,
-        temperature=1.0,
+        temperature=0.1,
+        top_p=0.95,
         max_completion_tokens=4096,
     )
     prompt = _normalize_prompt(str(payload.get("prompt", "")).strip()) or current_prompt
@@ -942,8 +960,8 @@ Review the prompt history below as a fallback when rendered images are unavailab
 {_history_summary(shared_history, top_n=4, bottom_n=4)}
 
 RESPONSE FORMAT:
-Return exactly 3 concise bullets, max 90 words total.
-Focus on concrete prompt changes future iterations should make.
+Provide a structured analysis of visual patterns observed, focusing on what distinguishes high-performing from low-performing ads.
+Cover composition, lighting, color palette, subject positioning, brand integration, and environmental elements. Focus on concrete changes future prompts should make.
 """
 
         try:
@@ -951,7 +969,8 @@ Focus on concrete prompt changes future iterations should make.
                 client,
                 system_prompt,
                 user_prompt,
-                temperature=0.7,
+                temperature=0.3,
+                top_p=0.9,
                 max_completion_tokens=4096,
             )
         except Exception:
@@ -979,8 +998,8 @@ Focus on concrete prompt changes future iterations should make.
                 "5. Brand integration approaches\n"
                 "6. Environmental and atmospheric elements\n\n"
                 "RESPONSE FORMAT:\n"
-                "Return exactly 3 concise bullets, max 90 words total. Focus only on "
-                "concrete prompt changes future iterations should make."
+                "Provide a structured analysis of visual patterns observed, focusing on "
+                "what distinguishes high-performing from low-performing ads."
             ),
         }
     )
@@ -991,7 +1010,8 @@ Focus on concrete prompt changes future iterations should make.
             client,
             system_prompt,
             multimodal_content,
-            temperature=0.7,
+            temperature=0.3,
+            top_p=0.9,
             max_completion_tokens=4096,
         )
     except Exception:
@@ -1064,6 +1084,7 @@ Be concise but specific. Focus on changes that will meaningfully improve ad effe
             "You generate textual gradients for advertising prompt optimization.",
             user_prompt,
             temperature=0.8,
+            top_p=0.9,
             max_completion_tokens=2048,
         )
     except Exception:
@@ -1101,6 +1122,7 @@ Return ONLY the revised prompt, no explanations or additional text."""
             "You apply textual gradients to image-generation prompts.",
             user_prompt,
             temperature=0.1,
+            top_p=0.95,
             max_completion_tokens=2048,
         )
         return _normalize_prompt(revised) or current_prompt

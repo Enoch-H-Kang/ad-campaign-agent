@@ -8,6 +8,7 @@ from prompts import SYSTEM_PROMPT
 from schema import validate_fields, format_fields_for_prompt
 
 TEXT_MODEL = "gpt-5-nano"
+TEXT_REASONING_EFFORT = "minimal"
 
 
 def get_openai_client(api_key: str) -> OpenAI:
@@ -67,6 +68,7 @@ def chat(
         messages=messages,
         temperature=1,
         max_completion_tokens=65536,
+        reasoning_effort=TEXT_REASONING_EFFORT,
     )
 
     return response.choices[0].message.content or ""
@@ -194,6 +196,7 @@ def extract_fields(
         messages=messages,
         temperature=1,
         max_completion_tokens=16384,
+        reasoning_effort=TEXT_REASONING_EFFORT,
         response_format={"type": "json_object"},
     )
 
