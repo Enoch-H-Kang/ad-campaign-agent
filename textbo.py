@@ -725,12 +725,6 @@ def _score_image_with_logprobs(
         judge_text = f"""PERSONA DATA:
 {_persona_sample_text(persona)}
 
-Campaign context:
-{_campaign_context_text(session_data, sidebar_settings, creative_brief)}
-
-Rendering prompt:
-{prompt}
-
 TASK:
 Return only one item from ["1","2","3","4","5"] for ad effectiveness.
 
@@ -810,8 +804,8 @@ Do not explain your answer."""
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": judge_text},
                         {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": judge_text},
                     ],
                 },
             ],
@@ -834,8 +828,8 @@ Do not explain your answer."""
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": judge_text},
                             {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": judge_text},
                         ],
                     },
                 ],
@@ -1509,11 +1503,9 @@ Your response must be exactly one character: either 1 or 2."""
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": comparison_prompt},
-                            {"type": "text", "text": "IMAGE 1:"},
                             {"type": "image_url", "image_url": {"url": image1_url}},
-                            {"type": "text", "text": "IMAGE 2:"},
                             {"type": "image_url", "image_url": {"url": image2_url}},
+                            {"type": "text", "text": comparison_prompt},
                         ],
                     },
                 ],
@@ -2756,8 +2748,10 @@ def _run_search_pipeline(
         hidden_baseline_results,
     )
 
+    best_initial_overall = max(ranked_initial, key=lambda item: item["score"])
+    best_starting_initial = max(worst_pool, key=lambda item: item["score"])
     overall_candidates = [
-        max(ranked_initial, key=lambda item: item["score"]),
+        best_starting_initial,
         efficient_results["best"],
     ]
     if hidden_baseline_results:
@@ -2770,6 +2764,8 @@ def _run_search_pipeline(
         "initial_candidates": initial_candidates,
         "initial_ranked": ranked_initial,
         "worst_pool": worst_pool,
+        "best_initial_overall": best_initial_overall,
+        "best_starting_initial": best_starting_initial,
         "base": hidden_baseline_results,
         "base_error": hidden_baseline_error,
         "efficient": efficient_results,
@@ -3093,6 +3089,7 @@ def _render_textbo_baseline_comparison(results: dict[str, Any]) -> None:
         st.metric("TextBO Best", _format_score(textbo_best["score"]))
     with metric_cols[1]:
         st.metric("Base Best", _format_score(baseline_best["score"]))
+        st.caption("Base = hidden N=1, G=1 optimizer")
     with metric_cols[2]:
         st.metric("TextBO Delta", f"{score_delta:+.6f}")
     st.markdown(f"Final comparison winner: **{winner_label}**")
@@ -3647,22 +3644,34 @@ if user_input:
 
 if st.session_state.optimization_results:
     results = st.session_state.optimization_results
-    overall_best = results["overall_best"]
 
     st.divider()
     st.header("Search Results")
 
     metric_cols = st.columns(3)
     with metric_cols[0]:
-        best_initial = max(results["initial_candidates"], key=lambda item: item["score"])
+        best_initial = results.get("best_starting_initial") or max(
+            results["worst_pool"],
+            key=lambda item: item["score"],
+        )
         st.metric("Best Initial", _format_score(best_initial["score"]))
+        st.caption(
+            f"Best among the {len(results['worst_pool'])} lowest starting prompts"
+        )
     with metric_cols[1]:
+        base_best = results["base"]["best"] if results.get("base") else None
         if results.get("base"):
-            st.metric("Best Base", _format_score(results["base"]["best"]["score"]))
+            st.metric("Best Base", _format_score(base_best["score"]))
+            st.caption("Base = hidden N=1, G=1 optimizer")
         else:
             st.metric("Best Base", "n/a")
     with metric_cols[2]:
         st.metric("Best TextBO", _format_score(results["efficient"]["best"]["score"]))
+
+    display_overall_candidates = [best_initial, results["efficient"]["best"]]
+    if base_best:
+        display_overall_candidates.append(base_best)
+    overall_best = max(display_overall_candidates, key=lambda item: item["score"])
 
     st.markdown(
         f"**Overall best score:** {_format_score(overall_best['score'])} "
